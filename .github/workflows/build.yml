@@ -1,0 +1,44 @@
+name: build-near
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find or install NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -1 || true)
+          fi
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+            yes | "$SDK"/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+            "$SDK"/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.2.12479018"
+            NDK="$SDK/ndk/27.2.12479018"
+          fi
+          echo "NDK=$NDK"
+          ls "$NDK/toolchains/llvm/prebuilt/" || true
+          echo "NDK_PATH=$NDK" >> "$GITHUB_ENV"
+
+      - name: Build libHassleExtended (arm64 + arm32)
+        run: |
+          F=$(find . -name build_near.py -not -path './.git/*' | head -1)
+          if [ -z "$F" ]; then echo "build_near.py не найден в репозитории:"; ls -R | head -50; exit 1; fi
+          cd "$(dirname "$F")"
+          echo "сборка в: $(pwd)"; ls
+          python3 build_near.py "$NDK_PATH"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp libHassleExtended_arm64.so libHassleExtended_arm32.so "$GITHUB_WORKSPACE/out/"
+
+      - name: Upload .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: near-so
+          path: out/*.so
