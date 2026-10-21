@@ -1099,8 +1099,8 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
     }
     if (t < 0) t = 5;                                   /* как в rec.js: по умолчанию 5 секунд */
     do_reconnect(t, &r);
-    if (r.ok) { b_s(&b, "Реконнект: отключено, подключение через "); b_int(&b, r.t); b_s(&b, " сек"); }
-    else { b_s(&b, "Реконнект: "); b_s(&b, r.why); }
+    if (r.ok) return;                                   /* успех — в чат ничего не пишем */
+    b_s(&b, "Реконнект: "); b_s(&b, r.why);             /* ошибку оставляем, чтобы было видно причину */
     chat_say(msg);
 }
 
