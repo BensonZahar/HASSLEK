@@ -68,7 +68,9 @@ extern char* dlerror(void);
 #ifndef NEAR_EXTRA_DELAY_S
 #define NEAR_EXTRA_DELAY_S 0  /* запасной рычаг: доп. пауза после готовности игры. Если вдруг вернутся вылеты на старте — собрать с -DNEAR_EXTRA_DELAY_S=10 */
 #endif
-#define SETTLE_MS 1500        /* пауза после того, как стал виден Assembly-CSharp (доинициализация IL2CPP), до первого присоединения потока */
+#ifndef NEAR_SETTLE_S
+#define NEAR_SETTLE_S 12      /* сколько секунд после появления libil2cpp.so мод НЕ вызывает ни одной её функции (идёт il2cpp_init). Можно менять файлом HLOG/near_delay.txt (число секунд) без пересборки */
+#endif
 #define POLL_US 250000        /* период лёгкого опроса готовности */
 
 /* ───────────── мелкие строковые помощники (без libc) ───────────── */
@@ -255,6 +257,7 @@ static struct {
 
 static void* g_il2cpp;
 static void* g_domain;
+static volatile int g_safe;          /* 1 — период ожидания после загрузки libil2cpp прошёл, функции IL2CPP звать можно */
 
 #define LOAD(n) do { *(void**)&A.n = dlsym(g_il2cpp, "il2cpp_" #n); if (!A.n) { missing = #n; } } while (0)
 
@@ -370,12 +373,30 @@ static __thread int tl_attached;
 static void ensure_attached(void) {
     if (!tl_attached && g_domain) { A.thread_attach(g_domain); tl_attached = 1; }
 }
-/* Лёгкая проверка: libil2cpp загружена, домен создан, Assembly-CSharp виден. Классов не трогает, поток не присоединяет. */
+/* libil2cpp.so уже загружена игрой? Ничего из неё НЕ вызывается (RTLD_NOLOAD) — безопасно в любой момент. */
+static int il2cpp_lib_visible(void) {
+    void* h = dlopen("libil2cpp.so", RTLD_NOW_ | 4);
+    return h != NULL;
+}
+/* Лёгкая проверка: libil2cpp загружена, домен создан, Assembly-CSharp виден. Классов не трогает, поток не присоединяет.
+   Вызывать только после g_safe: ранние вызовы il2cpp_domain_get/…_get_assemblies (до конца il2cpp_init) роняют игру.
+   Шаги пишутся в журнал ДО вызова — если игра всё же упадёт, последняя строка покажет, на каком вызове. */
 static int il2cpp_light(void) {
+    static int l1, l2, l3;
+    if (!g_safe) return 0;
+    if (!g_il2cpp && !l1) { l1 = 1; dlog("probe: il2cpp_open (dlsym функций API)"); }
     if (!il2cpp_open()) return 0;
-    if (!g_domain) g_domain = A.domain_get();
+    if (!g_domain) {
+        if (!l2) { l2 = 1; dlog("probe: il2cpp_domain_get"); }
+        g_domain = A.domain_get();
+        if (g_domain) dlog("probe: домен получен");
+    }
     if (!g_domain) return 0;
-    if (!g_img) g_img = find_image();
+    if (!g_img) {
+        if (!l3) { l3 = 1; dlog("probe: il2cpp_domain_get_assemblies + поиск Assembly-CSharp"); }
+        g_img = find_image();
+        if (g_img) dlog("probe: Assembly-CSharp найден");
+    }
     return g_img != NULL;
 }
 static void* g_cGame, *g_fGameInstance;
@@ -754,16 +775,46 @@ static int off_switch(void) {
 
 static void try_register_cmd(void);
 
+/* Сколько секунд ждать после появления libil2cpp: по умолчанию NEAR_SETTLE_S, либо число из файла HLOG/near_delay.txt */
+static int settle_seconds(void) {
+    char p[330], tmp[16]; unsigned L = slen(g_flog); int i, fd, v = -1, k = 0; long r;
+    if (L > 9 && L < 300) {
+        for (i = 0; i < (int)L - 8; i++) p[i] = g_flog[i];            /* папка со слэшем (без «near.log») */
+        p[i] = 0;
+        { const char* nm = "near_delay.txt"; for (k = 0; nm[k]; k++) p[i + k] = nm[k]; p[i + k] = 0; }
+        fd = open(p, 0);
+        if (fd >= 0) {
+            r = read(fd, tmp, sizeof tmp - 1); close(fd);
+            if (r > 0) {
+                tmp[r] = 0; v = 0;
+                for (k = 0; k < r && tmp[k] >= '0' && tmp[k] <= '9' && v < 100000; k++) v = v * 10 + (tmp[k] - '0');
+                if (k == 0) v = -1;
+            }
+        }
+    }
+    if (v < 0) return NEAR_SETTLE_S;
+    if (v > 600) v = 600;
+    dlog_i("collector: задержка взята из near_delay.txt, секунд ", v);
+    return v;
+}
+
 static void* collector_main(void* arg) {
-    int w;
+    int w, sec;
     (void)arg;
     init_log();
-    dlog("collector: старт, жду готовности игры (без фиксированной паузы)");
-    set_stage("ждём libil2cpp / Assembly-CSharp");
-    while (!il2cpp_light()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
-    dlog("collector: IL2CPP виден, короткая стабилизация");
-    usleep(SETTLE_MS * 1000);
-    set_stage("ждём запуск игры (Game.Instance)");
+    dlog("collector: старт");
+    set_stage("ждём загрузку libil2cpp.so");
+    while (!il2cpp_lib_visible()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
+    sec = settle_seconds();
+    dlog_i("collector: libil2cpp.so загружена; функции IL2CPP не трогаю, жду секунд ", sec);
+    for (w = 0; w < sec; w++) {
+        set_stage("IL2CPP инициализируется (мод ждёт)");
+        publish(0, g_stage, 0, 0, 0, 0, -1);
+        usleep(1000000);
+    }
+    g_safe = 1;
+    dlog("collector: пауза прошла, начинаю опрос IL2CPP");
+    set_stage("ждём Assembly-CSharp / Game.Instance");
     while (!game_ready()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
     dlog("collector: игра готова (Game.Instance создан), начинаю");
     for (w = 0; w < NEAR_EXTRA_DELAY_S; w++) usleep(1000000);
@@ -847,6 +898,7 @@ static void do_reconnect(int t, RecRes* r) {
     if (t < 0) t = 0;
     if (t > 600) t = 600;
     r->t = t;
+    if (!g_safe) { rec_set(r, "мод Near ещё стартует (ждёт конца загрузки IL2CPP), подождите"); return; }
     if (!il2cpp_light()) { rec_set(r, "IL2CPP ещё не готов (игра грузится, подождите)"); return; }
     now = time(NULL);
     if (now < g_recUntil) { rec_set(r, "реконнект уже запущен, подождите"); return; }
