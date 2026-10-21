@@ -61,7 +61,7 @@ extern long time(long*);
 #define NEAR_PORT_FIRST 17771
 #define NEAR_PORT_COUNT 10
 #define TICK_US 300000
-#define SETTLE_S 3            /* сколько секунд ждём после появления домена IL2CPP, прежде чем перебирать сборки (иначе гонка с инициализацией) */
+#define SETTLE_S 10            /* сколько секунд ждём после появления домена IL2CPP, прежде чем перебирать сборки (иначе гонка с инициализацией) */
 
 /* ───────────── мелкие строковые помощники (без libc) ───────────── */
 static unsigned slen(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
@@ -178,6 +178,7 @@ static struct {
     unsigned (*method_get_param_count)(void*);
     void* (*method_get_param)(void*, unsigned);
     void (*gc_wbarrier_set_field)(void*, void**, void*);
+    u8 (*class_is_inited)(void*);
 } A;
 
 static void* g_il2cpp;
@@ -205,8 +206,16 @@ static int il2cpp_open(void) {
     LOAD(string_chars); LOAD(string_length); LOAD(class_array_element_size); LOAD(class_get_element_class);
     LOAD(type_get_name);
     LOAD(object_new); LOAD(string_new); LOAD(class_get_methods); LOAD(method_get_name);
-    LOAD(method_get_param_count); LOAD(method_get_param); LOAD(gc_wbarrier_set_field);
+    LOAD(method_get_param_count); LOAD(method_get_param); LOAD(gc_wbarrier_set_field); LOAD(class_is_inited);
     if (missing) { dlog2("нет функции il2cpp_", missing); g_il2cpp = NULL; return 0; }
+    return 1;
+}
+
+/* Чтение статического поля ТОЛЬКО если класс уже инициализирован игрой: у неинициализированного класса память статики ещё
+   не выделена, и il2cpp_field_static_get_value может упасть по нулевому указателю (вероятная причина вылета на старте без паузы). */
+static int static_get(void* klass, void* field, void* out) {
+    if (!klass || !field || !A.class_is_inited || !A.class_is_inited(klass)) return 0;
+    A.field_static_get_value(field, out);
     return 1;
 }
 
@@ -278,6 +287,7 @@ static int struct_shift(void* sclass) {
 /* ───────────── поиск классов ───────────── */
 static void* g_img;
 static void* g_cPools, *g_cPlayerPool;
+static void* g_poolSrcClass;       /* класс, которому принадлежит g_poolSrcField */
 static void* g_poolSrcField;       /* static-поле, в котором лежит PlayerPool (или Pools) */
 static int g_poolSrcIsPools;
 static int g_fieldsDumped;
@@ -318,7 +328,7 @@ static void dump_class(void* k, const char* title) {
 static void* current_pool(void) {
     void* v = NULL;
     if (!g_poolSrcField) return NULL;
-    A.field_static_get_value(g_poolSrcField, &v);
+    if (!static_get(g_poolSrcClass, g_poolSrcField, &v)) return NULL;
     if (!v) return NULL;
     if (g_poolSrcIsPools) return ref_field(v, "Players");
     return v;
@@ -329,7 +339,7 @@ static void scan_for_pool(void) {
     /* 1) Pools.Players как статическое поле */
     if (g_cPools) {
         f = A.class_get_field_from_name(g_cPools, "Players");
-        if (f && (A.field_get_flags(f) & 0x10)) { g_poolSrcField = f; g_poolSrcIsPools = 0; dlog("PlayerPool: Pools.Players (static)"); return; }
+        if (f && (A.field_get_flags(f) & 0x10)) { g_poolSrcField = f; g_poolSrcClass = g_cPools; g_poolSrcIsPools = 0; dlog("PlayerPool: Pools.Players (static)"); return; }
     }
     /* 2) любое static-поле типа PlayerPool или Pools */
     n = A.image_get_class_count(g_img);
@@ -344,12 +354,12 @@ static void scan_for_pool(void) {
             if (!ty || A.type_get_type(ty) != 0x12) continue;      /* CLASS */
             c = A.class_from_type(ty);
             if (c == g_cPlayerPool) {
-                g_poolSrcField = f; g_poolSrcIsPools = 0;
+                g_poolSrcField = f; g_poolSrcClass = k; g_poolSrcIsPools = 0;
                 dlog2("PlayerPool: static-поле ", A.field_get_name(f)); dlog2("   в классе ", A.class_get_name(k));
                 return;
             }
             if (c == g_cPools) {
-                g_poolSrcField = f; g_poolSrcIsPools = 1;
+                g_poolSrcField = f; g_poolSrcClass = k; g_poolSrcIsPools = 1;
                 dlog2("Pools: static-поле ", A.field_get_name(f)); dlog2("   в классе ", A.class_get_name(k));
                 return;
             }
@@ -763,7 +773,7 @@ static void rec_core(int t, RecRes* r) {
     if (!cg) { rec_why(r, "класс Hassle.Game не найден"); return; }
     fn = A.class_get_field_from_name(cg, "Network");
     if (!fn) { rec_why(r, "поле Game.Network не найдено"); return; }
-    A.field_static_get_value(fn, &nc);
+    if (!static_get(cg, fn, &nc)) { rec_why(r, "игра ещё не инициализировала Game (подождите)"); return; }
     if (!nc) { rec_why(r, "Game.Network = null (вы не на сервере?)"); return; }
     nk = A.object_get_class(nc);
 
@@ -902,7 +912,7 @@ static void try_register_rec(void) {
     if (!cw) return;
     f = A.class_get_field_from_name(cw, "IsLoaded");
     if (!f) { g_cmdTries = 5; dlog("/rec: поле WebViewSystem.IsLoaded не найдено — команду не регистрирую"); return; }
-    A.field_static_get_value(f, &loaded);
+    if (!static_get(cw, f, &loaded)) return;               /* класс WebViewSystem ещё не инициализирован */
     if (!loaded) return;                                   /* интерфейс ещё грузится — Game.Awake уже точно отработал после этого */
     g_cmdTries++;
     while ((m = A.class_get_methods(cw, &it))) {           /* два перегруза: (string[], ...) и (string, ...) — нужен второй */
