@@ -17,6 +17,13 @@
  *     мода: Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
  *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). В Code3.js — команда /rec [секунд] (/rec2 — синоним).
  *
+ * Версия без паузы и без JS для /rec:
+ *   • Вместо слепых 60 секунд сборщик ждёт РЕАЛЬНУЮ готовность игры: libil2cpp загружена → виден Assembly-CSharp →
+ *     (короткая стабилизация SETTLE_MS) → создан Hassle.Game.Instance. Пока ждёт, IL2CPP не трогает дальше лёгкого опроса.
+ *   • /rec работает и без сборщика: GET /rec сам лениво инициализирует IL2CPP (набрать команду можно только когда игра уже идёт).
+ *   • Нативная чат-команда: мод регистрирует «/rec» прямо в реестре команд игры (WebViewSystem.m_ChatCommandEvents), так что
+ *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr.
+ *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
  * Код не использует libc-заголовки: прототипы объявлены вручную, поэтому собирается обычным clang без NDK.
  */
@@ -48,12 +55,17 @@ extern int usleep(unsigned);
 extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
 extern long time(long*);
+extern void* memcpy(void*, const void*, unsigned long);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
 #define NEAR_PORT_COUNT 10
 #define TICK_US 300000
-#define START_DELAY_S 60      /* столько секунд мод вообще не трогает IL2CPP после загрузки (игра ещё инициализируется) */
+#ifndef NEAR_EXTRA_DELAY_S
+#define NEAR_EXTRA_DELAY_S 0  /* запасной рычаг: доп. пауза после готовности игры. Если вдруг вернутся вылеты на старте — собрать с -DNEAR_EXTRA_DELAY_S=10 */
+#endif
+#define SETTLE_MS 1500        /* пауза после того, как стал виден Assembly-CSharp (доинициализация IL2CPP), до первого присоединения потока */
+#define POLL_US 250000        /* период лёгкого опроса готовности */
 
 /* ───────────── мелкие строковые помощники (без libc) ───────────── */
 static unsigned slen(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
@@ -163,11 +175,14 @@ static struct {
     int (*class_array_element_size)(void*);
     void* (*class_get_element_class)(void*);
     const char* (*type_get_name)(void*);
+    /* необязательные (нужны только для нативной команды /rec) */
+    void* (*string_new)(const char*);
+    void* (*object_new)(void*);
+    int (*class_instance_size)(void*);
 } A;
 
 static void* g_il2cpp;
 static void* g_domain;
-static int g_attached;
 
 #define LOAD(n) do { *(void**)&A.n = dlsym(g_il2cpp, "il2cpp_" #n); if (!A.n) { missing = #n; } } while (0)
 
@@ -188,6 +203,9 @@ static int il2cpp_open(void) {
     LOAD(class_from_type); LOAD(class_is_valuetype); LOAD(class_get_method_from_name); LOAD(runtime_invoke);
     LOAD(string_chars); LOAD(string_length); LOAD(class_array_element_size); LOAD(class_get_element_class);
     LOAD(type_get_name);
+    *(void**)&A.string_new = dlsym(g_il2cpp, "il2cpp_string_new");
+    *(void**)&A.object_new = dlsym(g_il2cpp, "il2cpp_object_new");
+    *(void**)&A.class_instance_size = dlsym(g_il2cpp, "il2cpp_class_instance_size");
     if (missing) { dlog2("нет функции il2cpp_", missing); g_il2cpp = NULL; return 0; }
     return 1;
 }
@@ -274,6 +292,32 @@ static void* find_image(void) {
         if (nm && sprefix(nm, "Assembly-CSharp") && !sprefix(nm, "Assembly-CSharp-")) return img;
     }
     return NULL;
+}
+
+static __thread int tl_attached;
+static void ensure_attached(void) {
+    if (!tl_attached && g_domain) { A.thread_attach(g_domain); tl_attached = 1; }
+}
+/* Лёгкая проверка: libil2cpp загружена, домен создан, Assembly-CSharp виден. Классов не трогает, поток не присоединяет. */
+static int il2cpp_light(void) {
+    if (!il2cpp_open()) return 0;
+    if (!g_domain) g_domain = A.domain_get();
+    if (!g_domain) return 0;
+    if (!g_img) g_img = find_image();
+    return g_img != NULL;
+}
+static void* g_cGame, *g_fGameInstance;
+/* Игра запущена: Hassle.Game.Instance создан (Game.Awake отработал). Нужен присоединённый поток. */
+static int game_ready(void) {
+    void* inst = NULL;
+    if (!il2cpp_light()) return 0;
+    if (!g_cGame) g_cGame = A.class_from_name(g_img, "Hassle", "Game");
+    if (!g_cGame) return 0;
+    if (!g_fGameInstance) g_fGameInstance = A.class_get_field_from_name(g_cGame, "Instance");
+    if (!g_fGameInstance) return 0;
+    ensure_attached();
+    A.field_static_get_value(g_fGameInstance, &inst);
+    return inst != NULL;
 }
 
 static void dump_class(void* k, const char* title) {
@@ -580,7 +624,7 @@ static void collect_tick(void) {
         g_cPools = A.class_from_name(g_img, "Hassle.Global.Pooling", "Pools");
         if (!g_cPlayerPool) { set_stage("класс PlayerPool не найден"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
     }
-    if (!g_attached) { A.thread_attach(g_domain); g_attached = 1; dlog("поток присоединён к IL2CPP"); }
+    if (!tl_attached) { ensure_attached(); dlog("поток присоединён к IL2CPP"); }
     if (!g_poolSrcField) scan_for_pool();
     if (!g_poolSrcField) { set_stage("static-поле с PlayerPool не найдено"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
     pool = current_pool();
@@ -636,14 +680,23 @@ static int off_switch(void) {
     return 0;
 }
 
+static void try_register_cmd(void);
+
 static void* collector_main(void* arg) {
     int w;
     (void)arg;
     init_log();
-    dlog("collector: старт, пауза перед первым чтением IL2CPP");
-    for (w = 0; w < START_DELAY_S; w++) usleep(1000000);
-    dlog("collector: пауза закончилась, начинаю");
+    dlog("collector: старт, жду готовности игры (без фиксированной паузы)");
+    set_stage("ждём libil2cpp / Assembly-CSharp");
+    while (!il2cpp_light()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
+    dlog("collector: IL2CPP виден, короткая стабилизация");
+    usleep(SETTLE_MS * 1000);
+    set_stage("ждём запуск игры (Game.Instance)");
+    while (!game_ready()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
+    dlog("collector: игра готова (Game.Instance создан), начинаю");
+    for (w = 0; w < NEAR_EXTRA_DELAY_S; w++) usleep(1000000);
     for (;;) {
+        try_register_cmd();                              /* нативная /rec: один раз, как только в реестре появится образец делегата */
         collect_tick();
         usleep(TICK_US);
     }
@@ -679,7 +732,6 @@ static char g_diag_out[24576 + 1024];
    Повторяет Hassle::Commands::Reconnect оригинального libHassleExtended (/rec): берёт Game.Network (static), читает
    m_Host/m_Port/m_Password/m_NickName, вызывает OnApplicationQuit() (посылает ID_DISCONNECTION_NOTIFICATION, если State == 2)
    и DelayedConnect(host, port, password, nick, секунды) — внутри UniTask.Delay(N) и затем NetworkClient.Connect(...). */
-static __thread int tl_attached;
 static long g_recUntil;                 /* до какого времени (time()) предыдущий реконнект ещё «в работе» */
 static char g_rec_out[1024];
 
@@ -704,32 +756,36 @@ static void exc_text(void* exc, char* out, int cap) {
     if (e2 || !s) return;
     { int n = A.string_length(s); if (n > 240) n = 240; utf16_to_utf8(A.string_chars(s), n, out, cap); }
 }
-static void rec_fail(int c, const char* why) {
-    Buf b; b_init(&b, g_rec_out, sizeof g_rec_out);
-    b_s(&b, "{\"ok\":0,\"why\":"); b_jstr(&b, why); b_ch(&b, '}');
-    dlog2("реконнект: отказ: ", why);
-    respond(c, "200 OK", "application/json", g_rec_out, b.n);
+typedef struct { int ok; int t; int state; int port; int quit; char why[200]; char exc[256]; } RecRes;
+static void rec_set(RecRes* r, const char* why) {
+    unsigned i = 0;
+    for (; why[i] && i < sizeof r->why - 1; i++) r->why[i] = why[i];
+    r->why[i] = 0; r->ok = 0;
+    dlog2("реконнект: отказ: ", r->why);
 }
-static void handle_rec(int c, const char* rq) {
-    int t = query_int(rq, "t", 0), state = -1, port = 0, quit_called = 0;
-    void *cg, *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL;
-    void *host, *pw, *nick; int ok = 0;
-    unsigned short port16; float tf;
-    char et[256]; long now;
 
+/* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
+   тогда, когда игра уже идёт, поэтому ждать сборщика (бывшие 60 секунд) не нужно. */
+static void do_reconnect(int t, RecRes* r) {
+    int state = -1, port = 0, ok = 0;
+    void *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL, *host, *pw, *nick;
+    unsigned short port16; float tf; char et[256]; long now;
+
+    r->ok = 0; r->state = -1; r->port = 0; r->quit = 0; r->why[0] = 0; r->exc[0] = 0;
     if (t < 0) t = 0;
     if (t > 600) t = 600;
-    if (!g_il2cpp || !g_domain || !g_img) { rec_fail(c, "мод ещё не готов (игра грузится, подождите)"); return; }
+    r->t = t;
+    if (!il2cpp_light()) { rec_set(r, "IL2CPP ещё не готов (игра грузится, подождите)"); return; }
     now = time(NULL);
-    if (now < g_recUntil) { rec_fail(c, "реконнект уже запущен, подождите"); return; }
-    if (!tl_attached) { A.thread_attach(g_domain); tl_attached = 1; }
+    if (now < g_recUntil) { rec_set(r, "реконнект уже запущен, подождите"); return; }
+    ensure_attached();
 
-    cg = A.class_from_name(g_img, "Hassle", "Game");
-    if (!cg) { rec_fail(c, "класс Hassle.Game не найден"); return; }
-    fn = A.class_get_field_from_name(cg, "Network");
-    if (!fn) { rec_fail(c, "поле Game.Network не найдено"); return; }
+    if (!g_cGame) g_cGame = A.class_from_name(g_img, "Hassle", "Game");
+    if (!g_cGame) { rec_set(r, "класс Hassle.Game не найден"); return; }
+    fn = A.class_get_field_from_name(g_cGame, "Network");
+    if (!fn) { rec_set(r, "поле Game.Network не найдено"); return; }
     A.field_static_get_value(fn, &nc);
-    if (!nc) { rec_fail(c, "Game.Network = null (вы не на сервере?)"); return; }
+    if (!nc) { rec_set(r, "Game.Network = null (вы не на сервере?)"); return; }
     nk = A.object_get_class(nc);
 
     state = (int)num_field(nc, "State", &ok);
@@ -737,10 +793,10 @@ static void handle_rec(int c, const char* rq) {
     pw = ref_field(nc, "m_Password");
     nick = ref_field(nc, "m_NickName");
     port = (int)num_field(nc, "m_Port", &ok);
-    if (!host || !nick) { rec_fail(c, "нет данных подключения (m_Host/m_NickName пусты)"); return; }
+    if (!host || !nick) { rec_set(r, "нет данных подключения (m_Host/m_NickName пусты)"); return; }
     mq = find_method(nk, "OnApplicationQuit", 0);
     md = find_method(nk, "DelayedConnect", 5);
-    if (!mq || !md) { rec_fail(c, !md ? "метод DelayedConnect не найден" : "метод OnApplicationQuit не найден"); return; }
+    if (!mq || !md) { rec_set(r, !md ? "метод DelayedConnect не найден" : "метод OnApplicationQuit не найден"); return; }
 
     dlog_i("реконнект: старт, секунд ", t);
     dlog_i("реконнект: State ", state);
@@ -750,7 +806,7 @@ static void handle_rec(int c, const char* rq) {
     exc = NULL;
     A.runtime_invoke(mq, nc, NULL, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
-    else quit_called = 1;
+    else r->quit = 1;
 
     /* 2) подключение через N секунд */
     port16 = (unsigned short)port; tf = (float)t;
@@ -767,25 +823,192 @@ static void handle_rec(int c, const char* rq) {
         }
     }
     if (exc) {
-        Buf b;
         exc_text(exc, et, sizeof et);
         dlog2("реконнект: DelayedConnect бросил: ", et);
-        b_init(&b, g_rec_out, sizeof g_rec_out);
-        b_s(&b, "{\"ok\":0,\"why\":\"DelayedConnect: исключение\",\"exc\":"); b_jstr(&b, et); b_ch(&b, '}');
-        respond(c, "200 OK", "application/json", g_rec_out, b.n);
+        rec_set(r, "DelayedConnect: исключение");
+        { unsigned i = 0; for (; et[i] && i < sizeof r->exc - 1; i++) r->exc[i] = et[i]; r->exc[i] = 0; }
         return;
     }
     g_recUntil = now + t + 3;
-    {
-        Buf b; b_init(&b, g_rec_out, sizeof g_rec_out);
-        b_s(&b, "{\"ok\":1,\"t\":"); b_int(&b, t);
-        b_s(&b, ",\"state\":"); b_int(&b, state);
-        b_s(&b, ",\"port\":"); b_int(&b, port);
-        b_s(&b, ",\"quit\":"); b_int(&b, quit_called);
+    r->ok = 1; r->state = state; r->port = port;
+    dlog("реконнект: DelayedConnect запущен");
+}
+
+static void handle_rec(int c, const char* rq) {
+    RecRes r; Buf b;
+    do_reconnect(query_int(rq, "t", 0), &r);
+    b_init(&b, g_rec_out, sizeof g_rec_out);
+    if (r.ok) {
+        b_s(&b, "{\"ok\":1,\"t\":"); b_int(&b, r.t);
+        b_s(&b, ",\"state\":"); b_int(&b, r.state);
+        b_s(&b, ",\"port\":"); b_int(&b, r.port);
+        b_s(&b, ",\"quit\":"); b_int(&b, r.quit);
         b_ch(&b, '}');
-        dlog("реконнект: DelayedConnect запущен");
-        respond(c, "200 OK", "application/json", g_rec_out, b.n);
+    } else {
+        b_s(&b, "{\"ok\":0,\"why\":"); b_jstr(&b, r.why);
+        if (r.exc[0]) { b_s(&b, ",\"exc\":"); b_jstr(&b, r.exc); }
+        b_ch(&b, '}');
     }
+    respond(c, "200 OK", "application/json", g_rec_out, b.n);
+}
+
+/* ───────────── нативная чат-команда /rec (без rec.js и без портов) ─────────────
+   В игре есть реестр чат-команд: WebViewSystem.m_ChatCommandEvents (Dictionary<string, ChatCommandEvent>), его заполняет сама игра через
+   RegisterChatCommandEvent; WebViewSystem.SendChatInput(текст) ищет команду там. Мы берём любой уже зарегистрированный игрой делегат
+   (с целью-объектом), клонируем его и подменяем method_ptr на нашу функцию — IL2CPP вызовет её как (this, string[] args, MethodInfo*).
+   Команда выполняется в главном потоке Unity. Ключи кладём и «/rec», и «rec» (какой формат ждёт реестр — выясняется по журналу /diag). */
+static int g_cmdDone, g_cmdTries, g_keyLogged;
+static void* g_tplDelegate;
+static int g_dictCount, g_keyHasSlash;
+
+typedef void (*kv_cb)(void* key, void* val, void* ctx);
+static void dict_each(void* dict, kv_cb cb, void* ctx) {
+    void *arr, *ac, *ec, *fk, *fv, *fh; int esz, i, shift, cnt, offk, offv, offh = 0; char* data; long len;
+    if (!dict) return;
+    arr = ref_field(dict, "_entries"); if (!arr) arr = ref_field(dict, "entries");
+    if (!arr) return;
+    ac = A.object_get_class(arr); ec = A.class_get_element_class(ac); esz = A.class_array_element_size(ac);
+    if (!ec || esz <= 0) return;
+    fk = find_field(ec, "key"); fv = find_field(ec, "value"); fh = find_field(ec, "hashCode");
+    if (!fk || !fv) return;
+    shift = A.class_is_valuetype(ec) ? struct_shift(ec) : 0;
+    offk = A.field_get_offset(fk) - shift; offv = A.field_get_offset(fv) - shift;
+    if (fh) offh = A.field_get_offset(fh) - shift;
+    cnt = int_field(dict, "_count", "count", NULL, -1);
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 100000) return;
+    if (cnt < 0 || cnt > len) cnt = (int)len;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < cnt; i++) {
+        char* e = data + (uptr)i * (uptr)esz;
+        if (fh && *(int*)(e + offh) < 0) continue;        /* свободная запись словаря */
+        cb(*(void**)(e + offk), *(void**)(e + offv), ctx);
+    }
+}
+static void tpl_cb(void* key, void* val, void* ctx) {
+    (void)ctx;
+    g_dictCount++;
+    if (key) {
+        int n = A.string_length(key); const u16* ch = A.string_chars(key);
+        if (n > 0 && ch && ch[0] == '/') g_keyHasSlash = 1;
+        if (g_keyLogged < 40 && n > 0 && n < 60 && ch) {
+            char tmp[160]; utf16_to_utf8(ch, n, tmp, sizeof tmp);
+            dlog2("реестр команд: ключ ", tmp); g_keyLogged++;
+        }
+    }
+    if (val && !g_tplDelegate) {
+        void* tgt = ref_field(val, "m_target"); void* dels = ref_field(val, "delegates");
+        if (tgt && !dels) g_tplDelegate = val;           /* обычный (не multicast) делегат с целью — годится как образец */
+    }
+}
+
+static void chat_say(const char* msg) {
+    void *cw, *m, *exc = NULL, *args[2];
+    if (!A.string_new || !g_img) return;
+    cw = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
+    if (!cw) return;
+    m = A.class_get_method_from_name(cw, "AddChatMessage", 2);
+    if (!m) return;
+    args[0] = A.string_new(msg); args[1] = A.string_new("white");
+    A.runtime_invoke(m, NULL, args, &exc);
+}
+
+/* аргументы команды: string[]; число секунд — первый числовой элемент (не важно, входит ли сама «/rec» в массив); «diag» — диагностика */
+static int parse_cmd_args(void* arr, int* diag) {
+    long len; int i, t = -1; char* data;
+    *diag = 0;
+    if (!arr) return -1;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return -1;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[64]; int n; const u16* ch;
+        if (!s) continue;
+        n = A.string_length(s); ch = A.string_chars(s);
+        if (n <= 0 || n > 40 || !ch) continue;
+        utf16_to_utf8(ch, n, tmp, sizeof tmp);
+        if (seq(tmp, "diag")) { *diag = 1; continue; }
+        if (t < 0 && tmp[0] >= '0' && tmp[0] <= '9') {
+            int v = 0, k = 0;
+            while (tmp[k] >= '0' && tmp[k] <= '9' && v < 100000) { v = v * 10 + (tmp[k] - '0'); k++; }
+            t = v;
+        }
+    }
+    return t;
+}
+
+static int g_port;
+/* Вызывается игрой в главном потоке: (this-цель делегата, string[] args, MethodInfo*) */
+static void native_rec_cmd(void* self, void* args, void* mi) {
+    RecRes r; int diag = 0, t; Buf b; char msg[300];
+    (void)self; (void)mi;
+    t = parse_cmd_args(args, &diag);
+    dlog_i("нативная /rec: вызвана, секунд ", t);
+    b_init(&b, msg, sizeof msg);
+    if (diag) {
+        b_s(&b, "Near: стадия «"); b_s(&b, g_stage); b_s(&b, "», HTTP-порт "); b_int(&b, g_port);
+        b_s(&b, ", /rec нативно: "); b_s(&b, g_cmdDone == 1 ? "да" : "нет");
+        chat_say(msg);
+        return;
+    }
+    if (t < 0) t = 5;                                   /* как в rec.js: по умолчанию 5 секунд */
+    do_reconnect(t, &r);
+    if (r.ok) { b_s(&b, "Реконнект: отключено, подключение через "); b_int(&b, r.t); b_s(&b, " сек"); }
+    else { b_s(&b, "Реконнект: "); b_s(&b, r.why); }
+    chat_say(msg);
+}
+
+static void cmd_fail(const char* why) { g_cmdDone = -1; dlog2("нативная /rec: не получилось, остаётся HTTP+rec.js. Причина: ", why); }
+static int cmd_put(void* dict, void* setitem, const char* key, void* del) {
+    void* args[2]; void* exc = NULL; char et[256];
+    args[0] = A.string_new(key); args[1] = del;
+    A.runtime_invoke(setitem, dict, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("нативная /rec: set_Item бросил: ", et); return 0; }
+    return 1;
+}
+static void try_register_cmd(void) {
+    void *cw, *fd, *dict = NULL, *kls, *nd, *mset, *f_mp, *f_ii; int size, i, off_mp, off_ii;
+    uptr mp, ii;
+    if (g_cmdDone) return;
+    if (++g_cmdTries > 1500) { cmd_fail("реестр команд так и не заполнился (нет образца делегата)"); return; }
+    if (!A.string_new || !A.object_new || !A.class_instance_size) { cmd_fail("нет il2cpp_string_new / object_new / class_instance_size"); return; }
+    cw = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
+    if (!cw) return;
+    fd = A.class_get_field_from_name(cw, "m_ChatCommandEvents");
+    if (!fd) { cmd_fail("поле WebViewSystem.m_ChatCommandEvents не найдено"); return; }
+    A.field_static_get_value(fd, &dict);
+    if (!dict) return;                                   /* реестр ещё не создан */
+    g_dictCount = 0; g_tplDelegate = NULL; g_keyHasSlash = 0;
+    dict_each(dict, tpl_cb, NULL);
+    if (!g_tplDelegate) return;                          /* игра ещё не зарегистрировала ни одной команды — образца нет, ждём */
+
+    kls = A.object_get_class(g_tplDelegate);
+    size = A.class_instance_size(kls);
+    if (size < 0x40 || size > 0x200) { cmd_fail("странный размер делегата"); return; }
+    f_mp = find_field(kls, "method_ptr");
+    if (!f_mp) { cmd_fail("в делегате нет поля method_ptr"); return; }
+    off_mp = A.field_get_offset(f_mp);
+    f_ii = find_field(kls, "invoke_impl");
+    off_ii = f_ii ? A.field_get_offset(f_ii) : 0;
+    mset = find_method(A.object_get_class(dict), "set_Item", 2);
+    if (!mset) { cmd_fail("у словаря нет set_Item"); return; }
+
+    nd = A.object_new(kls);
+    if (!nd) { cmd_fail("object_new вернул null"); return; }
+    for (i = 2 * (int)sizeof(void*); i < size; i++) ((char*)nd)[i] = ((char*)g_tplDelegate)[i];
+    mp = *(uptr*)((char*)g_tplDelegate + off_mp);
+    *(uptr*)((char*)nd + off_mp) = (uptr)native_rec_cmd;
+    if (f_ii) {
+        ii = *(uptr*)((char*)g_tplDelegate + off_ii);
+        if (ii == mp) *(uptr*)((char*)nd + off_ii) = (uptr)native_rec_cmd;   /* invoke_impl совпадал с method_ptr — подменяем тоже */
+    }
+    dlog_i("нативная /rec: записей в реестре ", g_dictCount);
+    dlog_i("нативная /rec: ключи начинаются с «/» ", g_keyHasSlash);
+    if (cmd_put(dict, mset, "/rec", nd) & cmd_put(dict, mset, "rec", nd)) {
+        g_cmdDone = 1;
+        dlog("нативная /rec: зарегистрирована («/rec» и «rec»)");
+    } else cmd_fail("не удалось записать делегат в реестр");
 }
 
 
@@ -796,7 +1019,6 @@ static void handle_diag(int c) {
     respond(c, "200 OK", "text/plain; charset=utf-8", g_diag_out, b.n);
 }
 
-static int g_port;
 static void* server_main(void* arg) {
     int fd = -1, i, one = 1;
     (void)arg;
