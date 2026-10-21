@@ -13,8 +13,9 @@
  *     последнего пакета синхронизации, HP/броню, пинг и счёт.
  *   • Второй поток — крошечный HTTP-сервер на 127.0.0.1:17771 (порты 17771..17780). HUD (Code3.js) опрашивает
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
- *   • Реконнект: GET /rec?t=N (N = секунд до подключения, 0..600, по умолчанию 0 = сразу) делает то же, что команда /rec оригинального
- *     мода: Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
+ *   • Реконнект: GET /rec?t=N (N = секунд до подключения, 1..600, по умолчанию 5): соединение закрывается СРАЗУ штатным
+ *     RakPeer::CloseConnection(sendDisconnectionNotification=true) из libRakNet.so (если этих функций нет — как в оригинальном моде:
+ *     Game.Network.OnApplicationQuit() — только пакет «ухожу»), затем через N секунд
  *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). В Code3.js — команда /rec [секунд] (/rec2 — синоним).
  *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
@@ -48,6 +49,9 @@ extern int usleep(unsigned);
 extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
 extern long time(long*);
+extern long write(int, const void*, unsigned long);
+extern int mkdir(const char*, unsigned);
+extern int rename(const char*, const char*);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
@@ -116,6 +120,50 @@ static int g_diag_ready;
 typedef void (*logfn_t)(int, const char*, const char*);
 static logfn_t g_alog;
 
+
+/* ───────────── журнал в файл: <папка игры>/files/HLog/near.log ─────────────
+   /sdcard/Android/data/<пакет>/files/HLog/near.log — журнал текущего запуска (тот же текст, что в /diag, с меткой «секунд с начала»);
+   при каждом запуске игры прежний near.log переименовывается в near_prev.log. Размер за запуск ограничен 1 МБ. */
+#define FL_WRONLY 1
+#define FL_CREAT 0x40
+#define FL_TRUNC 0x200
+#define FL_APPEND 0x400
+static int g_logfd = -2;            /* -2 — ещё не открывали, -1 — не получилось */
+static long g_logn, g_logt0;
+static void file_log(const char* s) {
+    char line[640]; Buf b; long n;
+    if (g_logfd == -2) {
+        char cmd[128], dir[300], path[320], prev[320]; Buf d, p, q; int fd; long m, i;
+        g_logfd = -1;
+        fd = open("/proc/self/cmdline", 0);
+        if (fd < 0) return;
+        m = read(fd, cmd, sizeof cmd - 1); close(fd);
+        if (m <= 0) return;
+        cmd[m] = 0;
+        for (i = 0; cmd[i]; i++) if (cmd[i] == ':') { cmd[i] = 0; break; }
+        b_init(&d, dir, sizeof dir); b_s(&d, "/sdcard/Android/data/"); b_s(&d, cmd); b_s(&d, "/files");
+        mkdir(dir, 0777);
+        b_s(&d, "/HLog"); mkdir(dir, 0777);
+        b_init(&p, path, sizeof path); b_s(&p, dir); b_s(&p, "/near.log");
+        b_init(&q, prev, sizeof prev); b_s(&q, dir); b_s(&q, "/near_prev.log");
+        rename(path, prev);
+        g_logfd = open(path, FL_WRONLY | FL_CREAT | FL_TRUNC | FL_APPEND, 0666);
+        g_logt0 = time(NULL);
+        if (g_logfd >= 0) {
+            b_init(&b, line, sizeof line);
+            b_s(&b, "=== Hassle Near: журнал запущен, пакет "); b_s(&b, cmd);
+            b_s(&b, ", unix-время "); b_int(&b, g_logt0); b_s(&b, "\n");
+            write(g_logfd, line, b.n);
+        }
+    }
+    if (g_logfd < 0 || g_logn > 1048576) return;
+    b_init(&b, line, sizeof line);
+    b_ch(&b, '['); b_ch(&b, '+'); b_int(&b, time(NULL) - g_logt0); b_s(&b, "с] "); b_s(&b, s); b_ch(&b, '\n');
+    n = write(g_logfd, line, b.n);
+    if (n > 0) g_logn += n;
+    if (g_logn > 1048576) write(g_logfd, "[журнал достиг 1 МБ и остановлен]\n", 59);
+}
+
 static void dlog(const char* s) {
     if (!g_diag_ready) { b_init(&g_diag, g_diag_mem, sizeof g_diag_mem); g_diag_ready = 1; }
     if (g_diag.n + 200 > g_diag.cap) {                  /* кольцо: когда заполнилось — начинаем сначала */
@@ -124,6 +172,7 @@ static void dlog(const char* s) {
     }
     b_s(&g_diag, s); b_ch(&g_diag, '\n');
     if (g_alog) g_alog(4, "HassleNear", s);
+    file_log(s);
 }
 static void dlog2(const char* a, const char* b) {
     char t[512]; Buf x; b_init(&x, t, sizeof t); b_s(&x, a); b_s(&x, b); dlog(t);
@@ -710,14 +759,89 @@ static void rec_fail(int c, const char* why) {
     dlog2("реконнект: отказ: ", why);
     respond(c, "200 OK", "application/json", g_rec_out, b.n);
 }
+
+/* ───── штатное закрытие соединения RakNet ─────
+   В C#-обёртке (Hassle.Network.RakNet.Native) функции закрытия нет, но libRakNet.so (SLikeNet) экспортирует C++-методы целиком.
+   Берём указатель на RakPeer из RakNetClient._nativeClient и вызываем
+     RakPeer::GetConnectionList(SystemAddress*, ushort*)  и
+     RakPeer::CloseConnection(AddressOrGUID, bool sendDisconnectionNotification, uchar channel, PacketPriority)
+   AddressOrGUID (40 байт) передаётся по ссылке: [0..15] RakNetGUID (UNASSIGNED), [16..35] SystemAddress (20 байт). Раскладка взята из DWARF
+   libRakNet.so: SystemAddress = sockaddr_in(16) + debugPort(2) + systemIndex(2). */
+typedef int  (*gcl_t)(void*, void*, unsigned short*);
+typedef void (*cc_t)(void*, void*, int, unsigned char, int);
+static void* g_rn;
+#define SADDR_SZ 20
+#define AOG_SZ 40
+
+static int rak_connections(void* peer, u8* list /* >= 8*SADDR_SZ */, int* have_api) {
+    gcl_t gcl; unsigned short n = 8;
+    if (have_api) *have_api = 0;
+    if (!peer) return -1;
+    if (!g_rn) g_rn = dlopen("libRakNet.so", RTLD_NOW_ | 4);
+    if (!g_rn) return -1;
+    gcl = (gcl_t)dlsym(g_rn, "_ZNK6RakNet7RakPeer17GetConnectionListEPNS_13SystemAddressEPt");
+    if (!gcl) return -1;
+    if (have_api) *have_api = 1;
+    gcl(peer, list, &n);
+    return n > 8 ? 8 : (int)n;
+}
+
+/* >0 — сколько соединений закрыто; 0 — активных нет; -1 — нужных функций libRakNet нет (тогда остаётся старый способ) */
+static int native_close_all(void* peer) {
+    u8 list[8 * SADDR_SZ + 16] __attribute__((aligned(8)));
+    u8 aog[AOG_SZ] __attribute__((aligned(8)));
+    int api = 0, n, i, k, closed = 0;
+    cc_t cc; const u8* ug;
+    for (i = 0; i < (int)sizeof list; i++) list[i] = 0;
+    n = rak_connections(peer, list, &api);
+    if (!api) { dlog("реконнект: libRakNet.so / GetConnectionList недоступны"); return -1; }
+    cc = (cc_t)dlsym(g_rn, "_ZN6RakNet7RakPeer15CloseConnectionENS_13AddressOrGUIDEbh14PacketPriority");
+    ug = (const u8*)dlsym(g_rn, "_ZN6RakNet22UNASSIGNED_RAKNET_GUIDE");
+    if (!cc) { dlog("реконнект: RakPeer::CloseConnection не найден в libRakNet.so"); return -1; }
+    dlog_i("реконнект: активных соединений RakNet: ", n);
+    for (i = 0; i < n; i++) {
+        for (k = 0; k < AOG_SZ; k++) aog[k] = 0;
+        if (ug) { for (k = 0; k < 16; k++) aog[k] = ug[k]; }
+        else    { for (k = 0; k < 10; k++) aog[k] = 0xFF; }          /* UNASSIGNED_RAKNET_GUID: g = -1, systemIndex = 0xFFFF */
+        for (k = 0; k < SADDR_SZ; k++) aog[16 + k] = list[i * SADDR_SZ + k];
+        cc(peer, aog, 1 /* отправить ID_DISCONNECTION_NOTIFICATION */, 0, 0 /* IMMEDIATE_PRIORITY */);
+        closed++;
+    }
+    return closed;
+}
+
+/* Наблюдение за реконнектом в /diag (State и число соединений), чтобы видеть, что делает игра после закрытия */
+static void* g_trace_nc;
+static int g_trace_t;
+static void* rec_trace_main(void* arg) {
+    int k, total_ms = 0, step, limit_ms = (g_trace_t + 4) * 1000;
+    char t[160]; Buf x; (void)arg;
+    if (limit_ms > 40000) limit_ms = 40000;
+    if (!tl_attached) { A.thread_attach(g_domain); tl_attached = 1; }
+    for (k = 0; total_ms < limit_ms; k++) {
+        void *rk, *peer; int ok = 0, st, n; u8 lst[8 * SADDR_SZ + 16] __attribute__((aligned(8))); int i;
+        step = k < 12 ? 250 : 1000;
+        usleep(step * 1000); total_ms += step;
+        for (i = 0; i < (int)sizeof lst; i++) lst[i] = 0;
+        st = (int)num_field(g_trace_nc, "State", &ok);
+        rk = ref_field(g_trace_nc, "m_RakNet");
+        peer = rk ? ref_field(rk, "_nativeClient") : NULL;
+        n = rak_connections(peer, lst, NULL);
+        b_init(&x, t, sizeof t);
+        b_s(&x, "реконнект: +"); b_int(&x, total_ms); b_s(&x, " мс: State="); b_int(&x, st);
+        b_s(&x, " соединений RakNet="); b_int(&x, n);
+        dlog(t);
+    }
+    return NULL;
+}
 static void handle_rec(int c, const char* rq) {
-    int t = query_int(rq, "t", 0), state = -1, port = 0, quit_called = 0;
-    void *cg, *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL;
+    int t = query_int(rq, "t", 5), state = -1, port = 0, quit_called = 0, closed = -2;
+    void *cg, *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL, *rk, *peer;
     void *host, *pw, *nick; int ok = 0;
     unsigned short port16; float tf;
     char et[256]; long now;
 
-    if (t < 0) t = 0;
+    if (t < 1) t = 1;       /* меньше секунды нельзя: соединение закрывается асинхронно, подключение раньше него упрётся в «уже подключены» */
     if (t > 600) t = 600;
     if (!g_il2cpp || !g_domain || !g_img) { rec_fail(c, "мод ещё не готов (игра грузится, подождите)"); return; }
     now = time(NULL);
@@ -746,11 +870,18 @@ static void handle_rec(int c, const char* rq) {
     dlog_i("реконнект: State ", state);
     dlog_i("реконнект: порт ", port);
 
-    /* 1) корректный выход с сервера (внутри сам проверяет State == Connected) */
-    exc = NULL;
-    A.runtime_invoke(mq, nc, NULL, &exc);
-    if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
-    else quit_called = 1;
+    /* 1) разрыв соединения СРАЗУ: штатный RakPeer::CloseConnection (серверу уходит ID_DISCONNECTION_NOTIFICATION, соединение закрывается);
+          если функций libRakNet нет — старый способ: OnApplicationQuit() (только пакет «ухожу», проверяет State == Connected) */
+    rk = ref_field(nc, "m_RakNet");
+    peer = rk ? ref_field(rk, "_nativeClient") : NULL;
+    closed = native_close_all(peer);
+    dlog_i("реконнект: закрыто соединений: ", closed);
+    if (closed < 0) {
+        exc = NULL;
+        A.runtime_invoke(mq, nc, NULL, &exc);
+        if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
+        else quit_called = 1;
+    }
 
     /* 2) подключение через N секунд */
     port16 = (unsigned short)port; tf = (float)t;
@@ -759,12 +890,6 @@ static void handle_rec(int c, const char* rq) {
         args[0] = host; args[1] = &port16; args[2] = pw; args[3] = nick; args[4] = &tf;
         exc = NULL;
         A.runtime_invoke(md, nc, args, &exc);
-        if (exc && t == 0) {   /* на случай, если нулевая задержка не принимается: повторяем с минимальной (0.1 с) */
-            exc_text(exc, et, sizeof et);
-            dlog2("реконнект: DelayedConnect(0) бросил, повтор с 0.1 с: ", et);
-            tf = 0.1f; exc = NULL;
-            A.runtime_invoke(md, nc, args, &exc);
-        }
     }
     if (exc) {
         Buf b;
@@ -782,9 +907,15 @@ static void handle_rec(int c, const char* rq) {
         b_s(&b, ",\"state\":"); b_int(&b, state);
         b_s(&b, ",\"port\":"); b_int(&b, port);
         b_s(&b, ",\"quit\":"); b_int(&b, quit_called);
+        b_s(&b, ",\"close\":"); b_int(&b, closed);
         b_ch(&b, '}');
         dlog("реконнект: DelayedConnect запущен");
         respond(c, "200 OK", "application/json", g_rec_out, b.n);
+    }
+    {   /* наблюдение за State / соединениями в /diag (отдельный поток, HTTP не блокирует) */
+        unsigned long tt = 0;
+        g_trace_nc = nc; g_trace_t = t;
+        pthread_create(&tt, NULL, rec_trace_main, NULL);
     }
 }
 
