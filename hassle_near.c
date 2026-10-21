@@ -56,6 +56,10 @@ extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
 extern long time(long*);
 extern void* memcpy(void*, const void*, unsigned long);
+extern int mkdir(const char*, unsigned);
+extern long write(int, const void*, unsigned long);
+extern int rename(const char*, const char*);
+extern char* dlerror(void);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
@@ -128,6 +132,73 @@ static int g_diag_ready;
 typedef void (*logfn_t)(int, const char*, const char*);
 static logfn_t g_alog;
 
+/* ───────────── файловый журнал: <папка игры>/files/HLOG/near.log ─────────────
+   Каждая строка дописывается в файл сразу же (open → write → close), поэтому при вылете последняя строка показывает, где всё оборвалось.
+   Основной путь: /sdcard/Android/data/<пакет>/files/HLOG/near.log  (Android/data/<пакет>/files/HLOG в файловом менеджере/по USB).
+   Если туда писать нельзя — запасной: /data/data/<пакет>/files/HLOG/near.log. Прошлый запуск сохраняется как near_prev.log. */
+static char g_flog[300], g_flog_prev[300];
+static int g_flogInit, g_flogLines, g_flogFallback;
+static volatile int g_flogLock;
+static long g_flogT0;
+
+static int pkg_name(char* out, int cap) {
+    char cmd[128]; int fd, i; long n;
+    out[0] = 0;
+    fd = open("/proc/self/cmdline", 0);
+    if (fd < 0) return 0;
+    n = read(fd, cmd, sizeof cmd - 1); close(fd);
+    if (n <= 0) return 0;
+    cmd[n] = 0;
+    for (i = 0; cmd[i] && cmd[i] != ':' && i < cap - 1; i++) out[i] = cmd[i];
+    out[i] = 0;
+    return i > 0;
+}
+static void flog_paths(const char* root, const char* pkg) {      /* root: "/sdcard/Android/data/" или "/data/data/" */
+    char d[300]; Buf b;
+    b_init(&b, d, sizeof d); b_s(&b, root); b_s(&b, pkg); mkdir(d, 0777);
+    b_s(&b, "/files"); mkdir(d, 0777);
+    b_s(&b, "/HLOG"); mkdir(d, 0777);
+    b_init(&b, g_flog, sizeof g_flog); b_s(&b, d); b_s(&b, "/near.log");
+    b_init(&b, g_flog_prev, sizeof g_flog_prev); b_s(&b, d); b_s(&b, "/near_prev.log");
+}
+static int flog_write(const char* path, const char* data, unsigned n, int create_new) {
+    int fd = open(path, create_new ? 0x241 : 0x441, 0666);        /* O_WRONLY|O_CREAT|(O_TRUNC | O_APPEND) */
+    if (fd < 0) return 0;
+    write(fd, data, n); close(fd);
+    return 1;
+}
+static void file_log(const char* line) {
+    char t[700]; Buf b; long now;
+    while (__sync_lock_test_and_set(&g_flogLock, 1)) usleep(200);
+    if (g_flogLines > 4000) { __sync_lock_release(&g_flogLock); return; }
+    now = time(NULL);
+    if (!g_flogInit) {
+        char pkg[100];
+        g_flogInit = 1; g_flogT0 = now;
+        if (pkg_name(pkg, sizeof pkg)) {
+            flog_paths("/sdcard/Android/data/", pkg);
+            rename(g_flog, g_flog_prev);                          /* прошлый запуск (мог закончиться вылетом) не теряем */
+            if (!flog_write(g_flog, "", 0, 1)) {                  /* внешняя папка недоступна — запасная внутренняя */
+                flog_paths("/data/data/", pkg); g_flogFallback = 1;
+                rename(g_flog, g_flog_prev);
+                if (!flog_write(g_flog, "", 0, 1)) g_flog[0] = 0;
+            }
+        } else g_flog[0] = 0;
+        if (g_flog[0]) {
+            b_init(&b, t, sizeof t); b_s(&b, "== запуск мода Near; файл: "); b_s(&b, g_flog);
+            if (g_flogFallback) b_s(&b, "  (ВНУТРЕННЯЯ папка: в /sdcard/Android/data писать нельзя)");
+            b_s(&b, "\n"); flog_write(g_flog, t, b.n, 0);
+        }
+    }
+    if (g_flog[0]) {
+        b_init(&b, t, sizeof t);
+        b_ch(&b, '+'); b_int(&b, now - g_flogT0); b_s(&b, "с  "); b_s(&b, line); b_ch(&b, '\n');
+        flog_write(g_flog, t, b.n, 0);
+        g_flogLines++;
+    }
+    __sync_lock_release(&g_flogLock);
+}
+
 static void dlog(const char* s) {
     if (!g_diag_ready) { b_init(&g_diag, g_diag_mem, sizeof g_diag_mem); g_diag_ready = 1; }
     if (g_diag.n + 200 > g_diag.cap) {                  /* кольцо: когда заполнилось — начинаем сначала */
@@ -136,6 +207,7 @@ static void dlog(const char* s) {
     }
     b_s(&g_diag, s); b_ch(&g_diag, '\n');
     if (g_alog) g_alog(4, "HassleNear", s);
+    file_log(s);
 }
 static void dlog2(const char* a, const char* b) {
     char t[512]; Buf x; b_init(&x, t, sizeof t); b_s(&x, a); b_s(&x, b); dlog(t);
@@ -1066,12 +1138,17 @@ static void start_threads(void) {
     g_started = 1;
     init_log();
     if (off_switch()) { dlog("near_off найден: мод отключён, работает только оригинал"); return; }
+    dlog("start_threads: near_off нет, мод включён");
     dlog("start_threads: запускаю сервер и сборщик");
     pthread_create(&t1, NULL, server_main, NULL);
     pthread_create(&t2, NULL, collector_main, NULL);
 }
 
 #ifndef NEAR_TEST
+__attribute__((constructor)) static void near_ctor(void) {
+    init_log();
+    dlog("near_ctor: наша .so загружена системой (ещё до JNI_OnLoad)");
+}
 typedef int (*jni_onload_t)(void*, void*);
 typedef void (*jni_onunload_t)(void*, void*);
 static void* g_orig;
@@ -1080,7 +1157,8 @@ static void* g_orig;
 EXPORT int JNI_OnLoad(void* vm, void* reserved) {
     int ver = 0x00010006;                                  /* JNI_VERSION_1_6 */
     init_log();
-    dlog("JNI_OnLoad: вход, грузим оригинал (libHassleExtend2.so / libHassleMain2.so)");
+    dlog_i("JNI_OnLoad: вход, разрядность указателя (бит) ", (long)(sizeof(void*) * 8));
+    dlog("JNI_OnLoad: грузим оригинал (libHassleExtend2.so / libHassleMain2.so)");
     g_orig = dlopen("libHassleExtend2.so", RTLD_NOW_);
     if (g_orig) dlog("JNI_OnLoad: режим старого клиента (libHassleExtend2.so)");
     else {
@@ -1092,7 +1170,11 @@ EXPORT int JNI_OnLoad(void* vm, void* reserved) {
         dlog("JNI_OnLoad: оригинал загружен, вызываю его JNI_OnLoad");
         if (f) ver = f(vm, reserved);
         dlog_i("JNI_OnLoad: оригинал вернул версию ", ver);
-    } else dlog("JNI_OnLoad: оригинал (libHassleExtend2.so / libHassleMain2.so) НЕ загрузился");
+    } else {
+        const char* de = dlerror();
+        dlog("JNI_OnLoad: оригинал (libHassleExtend2.so / libHassleMain2.so) НЕ загрузился");
+        dlog2("JNI_OnLoad: dlerror: ", de ? de : "(нет)");
+    }
     start_threads();
     dlog("JNI_OnLoad: выход");
     return ver;
