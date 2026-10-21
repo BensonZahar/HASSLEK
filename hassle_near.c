@@ -373,10 +373,25 @@ static __thread int tl_attached;
 static void ensure_attached(void) {
     if (!tl_attached && g_domain) { A.thread_attach(g_domain); tl_attached = 1; }
 }
-/* libil2cpp.so уже загружена игрой? Ничего из неё НЕ вызывается (RTLD_NOLOAD) — безопасно в любой момент. */
-static int il2cpp_lib_visible(void) {
-    void* h = dlopen("libil2cpp.so", RTLD_NOW_ | 4);
-    return h != NULL;
+/* libil2cpp.so уже загружена игрой? Смотрим /proc/self/maps — это обычное чтение файла, с динамическим загрузчиком не связано.
+   (dlopen(..., RTLD_NOLOAD) из фонового потока, пока главный поток грузит библиотеки, ронял игру — журнал оборвался на этом цикле.)
+   Возврат: 1 — есть, 0 — нет, -1 — maps прочитать нельзя. */
+static int lib_mapped(void) {
+    static char buf[8192];
+    int fd, found = 0, keep = 0, i; long n; const char* pat = "libil2cpp.so";
+    fd = open("/proc/self/maps", 0);
+    if (fd < 0) return -1;
+    for (;;) {
+        n = read(fd, buf + keep, sizeof buf - 1 - keep);
+        if (n <= 0) break;
+        n += keep; buf[n] = 0;
+        for (i = 0; i < n; i++) if (buf[i] == 'l' && sprefix(buf + i, pat)) { found = 1; break; }
+        if (found) break;
+        keep = 11 < n ? 11 : (int)n;                      /* хвост, чтобы не потерять совпадение на границе блоков */
+        for (i = 0; i < keep; i++) buf[i] = buf[n - keep + i];
+    }
+    close(fd);
+    return found;
 }
 /* Лёгкая проверка: libil2cpp загружена, домен создан, Assembly-CSharp виден. Классов не трогает, поток не присоединяет.
    Вызывать только после g_safe: ранние вызовы il2cpp_domain_get/…_get_assemblies (до конца il2cpp_init) роняют игру.
@@ -799,23 +814,29 @@ static int settle_seconds(void) {
 }
 
 static void* collector_main(void* arg) {
-    int w, sec;
+    int w, sec, polls = 0, m;
     (void)arg;
-    init_log();
     dlog("collector: старт");
-    set_stage("ждём загрузку libil2cpp.so");
-    while (!il2cpp_lib_visible()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
+    set_stage("ждём загрузку libil2cpp.so"); publish(0, g_stage, 0, 0, 0, 0, -1);
+    for (;;) {                                           /* только чтение /proc/self/maps, никаких вызовов dlopen/IL2CPP */
+        m = lib_mapped();
+        if (m > 0) break;
+        if (m < 0 && polls > 60) { dlog("collector: /proc/self/maps недоступен, продолжаю по таймеру"); break; }
+        polls++;
+        if (polls % 4 == 0) dlog_i("collector: libil2cpp.so ещё не загружена, опросов ", polls);
+        usleep(500000);
+    }
     sec = settle_seconds();
     dlog_i("collector: libil2cpp.so загружена; функции IL2CPP не трогаю, жду секунд ", sec);
-    for (w = 0; w < sec; w++) {
-        set_stage("IL2CPP инициализируется (мод ждёт)");
-        publish(0, g_stage, 0, 0, 0, 0, -1);
-        usleep(1000000);
-    }
+    set_stage("IL2CPP инициализируется (мод ждёт)"); publish(0, g_stage, 0, 0, 0, 0, -1);
+    for (w = 0; w < sec; w++) usleep(1000000);
     g_safe = 1;
     dlog("collector: пауза прошла, начинаю опрос IL2CPP");
-    set_stage("ждём Assembly-CSharp / Game.Instance");
-    while (!game_ready()) { publish(0, g_stage, 0, 0, 0, 0, -1); usleep(POLL_US); }
+    set_stage("ждём Assembly-CSharp / Game.Instance"); publish(0, g_stage, 0, 0, 0, 0, -1);
+    for (w = 0; !game_ready(); w++) {
+        if (w % 20 == 0) dlog_i("collector: игра ещё не готова, опросов ", w);
+        usleep(POLL_US);
+    }
     dlog("collector: игра готова (Game.Instance создан), начинаю");
     for (w = 0; w < NEAR_EXTRA_DELAY_S; w++) usleep(1000000);
     for (;;) {
@@ -1169,6 +1190,7 @@ static void* server_main(void* arg) {
             n = recv(c, rq, sizeof rq - 1, 0);
             if (n > 0) {
                 rq[n] = 0;
+                { static int hl; if (hl < 15) { char q[48]; int k; hl++; for (k = 0; k < 47 && rq[k] && rq[k] != '\r' && rq[k] != '\n'; k++) q[k] = rq[k]; q[k] = 0; dlog2("HTTP: запрос ", q); } }
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
                 else if (sprefix(rq, "GET /rec")) handle_rec(c, rq);
