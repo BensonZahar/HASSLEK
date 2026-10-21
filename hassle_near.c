@@ -17,13 +17,6 @@
  *     мода: Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
  *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). В Code3.js — команда /rec [секунд] (/rec2 — синоним).
  *
- * v2 — актуальность позиции
- *   • Тик 100 мс (было 300): позиции и дистанции читаются 10 раз в секунду.
- *   • Для каждого игрока и для себя мод считает скорость vx,vy,vz (м/с) по тому, как менялась позиция в sync-данных
- *     (единицы MoveSpeed не угадываем), и возраст позиции age (мс с последнего изменения).
- *   • /near отдаёт "ago" — сколько мс прошло с тика до ответа; в "me" добавлен ping. По этим полям Near.js прогнозирует
- *     дистанцию, которую увидит СЕРВЕР в момент команды (IsPlayerInRangeOfPoint), и считает неопределённость.
- *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
  * Код не использует libc-заголовки: прототипы объявлены вручную, поэтому собирается обычным clang без NDK.
  */
@@ -55,12 +48,11 @@ extern int usleep(unsigned);
 extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
 extern long time(long*);
-extern int clock_gettime(int, void*);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
 #define NEAR_PORT_COUNT 10
-#define TICK_US 100000        /* период чтения: 10 раз в секунду (было 300 мс) */
+#define TICK_US 300000
 #define START_DELAY_S 60      /* столько секунд мод вообще не трогает IL2CPP после загрузки (игра ещё инициализируется) */
 
 /* ───────────── мелкие строковые помощники (без libc) ───────────── */
@@ -423,58 +415,11 @@ static int walk_collection(void* coll, item_cb cb, void* ctx) {
 /* ───────────── чтение игроков ───────────── */
 typedef struct {
     int id; int hasPos; float x, y, z; double hp, ar, ping, score; int veh; char label[96]; char nick[64]; int labelId;
-    float vx, vy, vz; long age;      /* скорость м/с (по смене позиции) и возраст позиции, мс */
 } PInfo;
 #define MAXP 256
 static PInfo g_pl[MAXP];
 static int g_np;
 static void* g_local;
-
-/* ───────────── часы и трекер скорости ─────────────
-   В sync-данных (OnFoot/Drive/Passenger) есть Position и MoveSpeed, но нет метки времени, а единицы MoveSpeed клиент
-   мог пересчитать. Поэтому скорость считаем сами: как смещалась позиция между моментами, когда мы увидели её смену. */
-static long long now_ms(void) {
-    struct { long s; long ns; } ts;
-    ts.s = 0; ts.ns = 0;
-    clock_gettime(1, &ts);                               /* CLOCK_MONOTONIC */
-    return (long long)ts.s * 1000 + ts.ns / 1000000;
-}
-#define TRK_N 1024                                       /* слоты по ID игрока; слот TRK_N — локальный игрок */
-typedef struct { int used; float px, py, pz; long long tchg, tseen; float vx, vy, vz; } Trk;
-static Trk g_trk[TRK_N + 1];
-static long long g_now;                                  /* время текущего тика */
-static volatile long long g_tickAt;                      /* когда опубликован последний JSON (для "ago") */
-
-static void trk_update(int slot, int hasPos, const float* pos, float* vx, float* vy, float* vz, long* age) {
-    Trk* k; float dx, dy, dz, dist;
-    *vx = *vy = *vz = 0; *age = -1;
-    if (!hasPos || slot < 0 || slot > TRK_N) return;
-    k = &g_trk[slot];
-    if (!k->used || g_now - k->tseen > 2000) {           /* первый раз или долгий перерыв (слот отдан другому игроку) */
-        k->used = 1; k->px = pos[0]; k->py = pos[1]; k->pz = pos[2];
-        k->tchg = g_now; k->vx = k->vy = k->vz = 0;
-    } else {
-        dx = pos[0] - k->px; dy = pos[1] - k->py; dz = pos[2] - k->pz;
-        dist = __builtin_sqrtf(dx * dx + dy * dy + dz * dz);
-        if (dist > 0.02f) {                              /* позиция в sync-данных сменилась */
-            long long dt = g_now - k->tchg;
-            if (dt >= 30 && dt <= 1500 && dist < 60.0f) {
-                float rx = dx * 1000.0f / (float)dt, ry = dy * 1000.0f / (float)dt, rz = dz * 1000.0f / (float)dt;
-                float rs = __builtin_sqrtf(rx * rx + ry * ry + rz * rz);
-                if (rs > 90.0f) { k->vx = k->vy = k->vz = 0; }       /* телепорт / скачок — не скорость */
-                else {                                                /* сглаживаем: моменты тиков дают шум по dt */
-                    k->vx = k->vx * 0.6f + rx * 0.4f; k->vy = k->vy * 0.6f + ry * 0.4f; k->vz = k->vz * 0.6f + rz * 0.4f;
-                }
-            } else { k->vx = k->vy = k->vz = 0; }
-            k->px = pos[0]; k->py = pos[1]; k->pz = pos[2]; k->tchg = g_now;
-        } else if (g_now - k->tchg > 400) {              /* давно нет новых пакетов — стоит (или связь потеряна) */
-            k->vx = k->vy = k->vz = 0;
-        }
-    }
-    k->tseen = g_now;
-    *vx = k->vx; *vy = k->vy; *vz = k->vz;
-    *age = (long)(g_now - k->tchg);
-}
 
 static int read_pos(void* player, float* out) {
     int nu, ok = 0; const char* sname; void* sf; void* sc; char* sp; int shift, poff; void* pf;
@@ -565,7 +510,6 @@ static void on_player(void* item, void* ctx) {
     if (item == g_local) return;
     p->hasPos = read_pos(item, pos);
     p->x = p->hasPos ? pos[0] : 0; p->y = p->hasPos ? pos[1] : 0; p->z = p->hasPos ? pos[2] : 0;
-    trk_update(p->id >= 0 && p->id < TRK_N ? p->id : -1, p->hasPos, pos, &p->vx, &p->vy, &p->vz, &p->age);
     p->hp = num_field(item, "m_Health", &ok);
     p->ar = num_field(item, "m_Armour", &ok);
     p->ping = num_field(item, "Ping", &ok);
@@ -577,7 +521,7 @@ static void on_player(void* item, void* ctx) {
 }
 
 /* ───────────── итоговый JSON ───────────── */
-static char g_json[2][65536];
+static char g_json[2][32768];
 static volatile int g_jsonCur;
 static volatile unsigned g_ticks;
 static char g_stage[160] = "старт";
@@ -589,7 +533,6 @@ static void set_stage(const char* s) {
     g_stage[i] = 0;
     dlog2("стадия: ", s);
 }
-static float g_mvx, g_mvy, g_mvz; static long g_mage = -1; static double g_mePing;   /* скорость/возраст/пинг локального игрока */
 static void publish(int ok, const char* why, int havePos, float mx, float my, float mz, int meId) {
     Buf b; int next = g_jsonCur ^ 1, i;
     b_init(&b, g_json[next], sizeof g_json[next]);
@@ -597,24 +540,16 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
     b_s(&b, ",\"stage\":"); b_jstr(&b, why);
     b_s(&b, ",\"tick\":"); b_int(&b, (long)g_ticks);
     b_s(&b, ",\"me\":{\"id\":"); b_int(&b, meId);
-    if (havePos) {
-        b_s(&b, ",\"x\":"); b_fix(&b, mx, 1); b_s(&b, ",\"y\":"); b_fix(&b, my, 1); b_s(&b, ",\"z\":"); b_fix(&b, mz, 1);
-        b_s(&b, ",\"vx\":"); b_fix(&b, g_mvx, 1); b_s(&b, ",\"vy\":"); b_fix(&b, g_mvy, 1); b_s(&b, ",\"vz\":"); b_fix(&b, g_mvz, 1);
-        b_s(&b, ",\"age\":"); b_int(&b, g_mage);
-    }
-    b_s(&b, ",\"ping\":"); b_fix(&b, g_mePing, 0);
+    if (havePos) { b_s(&b, ",\"x\":"); b_fix(&b, mx, 1); b_s(&b, ",\"y\":"); b_fix(&b, my, 1); b_s(&b, ",\"z\":"); b_fix(&b, mz, 1); }
     b_s(&b, "},\"n\":[");
     for (i = 0; i < g_np; i++) {
         PInfo* p = &g_pl[i];
-        if (b.n + 600 > b.cap) break;                   /* не обрезаем JSON посередине игрока */
         if (i) b_ch(&b, ',');
         b_s(&b, "{\"id\":"); b_int(&b, p->id);
         b_s(&b, ",\"nick\":"); b_jstr(&b, p->nick);
         b_s(&b, ",\"label\":"); b_jstr(&b, p->label);
         if (p->hasPos) {
             b_s(&b, ",\"x\":"); b_fix(&b, p->x, 1); b_s(&b, ",\"y\":"); b_fix(&b, p->y, 1); b_s(&b, ",\"z\":"); b_fix(&b, p->z, 1);
-            b_s(&b, ",\"vx\":"); b_fix(&b, p->vx, 1); b_s(&b, ",\"vy\":"); b_fix(&b, p->vy, 1); b_s(&b, ",\"vz\":"); b_fix(&b, p->vz, 1);
-            b_s(&b, ",\"age\":"); b_int(&b, p->age);
             if (havePos) {
                 double dx = p->x - mx, dy = p->y - my, dz = p->z - mz;
                 b_s(&b, ",\"d\":"); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1);
@@ -629,15 +564,12 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
         b_ch(&b, '}');
     }
     b_s(&b, "]}");
-    g_tickAt = g_now;
     g_jsonCur = next;
 }
 
 static void collect_tick(void) {
     void* pool; void* stream; float me[3] = {0, 0, 0}; int havePos = 0, meId = -1;
     g_ticks++;
-    g_now = now_ms();
-    g_mvx = g_mvy = g_mvz = 0; g_mage = -1;
     if (!il2cpp_open()) { set_stage("ждём libil2cpp"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
     if (!g_domain) g_domain = A.domain_get();
     if (!g_domain) { set_stage("ждём домен IL2CPP"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
@@ -662,8 +594,6 @@ static void collect_tick(void) {
     if (g_local) {
         meId = int_field(g_local, "m_ID", NULL, NULL, -1);
         havePos = read_pos(g_local, me);
-        { int okp = 0; g_mePing = num_field(g_local, "Ping", &okp); if (!okp) g_mePing = 0; }
-        trk_update(TRK_N, havePos, me, &g_mvx, &g_mvy, &g_mvz, &g_mage);
     }
     stream = ref_field(pool, "PlayersInStream");
     if (!stream) { set_stage("PlayersInStream = null"); g_np = 0; publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
@@ -744,18 +674,6 @@ static void respond(int fd, const char* status, const char* ctype, const char* b
 }
 
 static char g_diag_out[24576 + 1024];
-static char g_near_out[65536 + 64];                      /* ответ /near: JSON тика + "ago" (только поток сервера) */
-
-static void handle_near(int c) {
-    const char* j = g_json[g_jsonCur]; unsigned n = slen(j); Buf b;
-    long long ago = g_tickAt ? now_ms() - g_tickAt : 0;
-    if (ago < 0) ago = 0;
-    if (n < 2 || j[n - 1] != '}') { respond(c, "200 OK", "application/json", j, n); return; }
-    b_init(&b, g_near_out, sizeof g_near_out);
-    { unsigned i; for (i = 0; i + 1 < n && b.n + 1 < b.cap; i++) b_ch(&b, j[i]); }
-    b_s(&b, ",\"ago\":"); b_int(&b, (long)ago); b_ch(&b, '}');
-    respond(c, "200 OK", "application/json", g_near_out, b.n);
-}
 
 /* ───────────── реконнект: GET /rec?t=N ─────────────
    Повторяет Hassle::Commands::Reconnect оригинального libHassleExtended (/rec): берёт Game.Network (static), читает
@@ -906,7 +824,7 @@ static void* server_main(void* arg) {
             if (n > 0) {
                 rq[n] = 0;
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
-                else if (sprefix(rq, "GET /near")) handle_near(c);
+                else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
                 else if (sprefix(rq, "GET /rec")) handle_rec(c, rq);
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);
