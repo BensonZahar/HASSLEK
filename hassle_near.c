@@ -13,14 +13,14 @@
  *     последнего пакета синхронизации, HP/броню, пинг и счёт.
  *   • Второй поток — крошечный HTTP-сервер на 127.0.0.1:17771 (порты 17771..17780). HUD (Code3.js) опрашивает
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
- *   • Реконнект: GET /rec?t=N (N = секунд до подключения, 0..600, по умолчанию 0 = сразу) делает то же, что команда /rec оригинального
- *     мода: Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
- *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). В Code3.js — команда /rec [секунд] (/rec2 — синоним).
+ *   • Реконнект — только нативная чат-команда /rec [секунд] (HTTP-эндпоинта /rec больше нет): Game.Network.OnApplicationQuit()
+ *     (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
+ *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N).
  *
  * Версия без паузы и без JS для /rec:
  *   • Вместо слепых 60 секунд сборщик ждёт РЕАЛЬНУЮ готовность игры: libil2cpp загружена → виден Assembly-CSharp →
  *     (короткая стабилизация SETTLE_MS) → создан Hassle.Game.Instance. Пока ждёт, IL2CPP не трогает дальше лёгкого опроса.
- *   • /rec работает и без сборщика: GET /rec сам лениво инициализирует IL2CPP (набрать команду можно только когда игра уже идёт).
+ *   • /rec работает и без сборщика: команда сама лениво инициализирует IL2CPP (набрать её можно только когда игра уже идёт).
  *   • Нативная чат-команда: мод регистрирует «/rec» прямо в реестре команд игры (WebViewSystem.m_ChatCommandEvents), так что
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr.
  *
@@ -69,7 +69,8 @@ extern char* dlerror(void);
 #define NEAR_EXTRA_DELAY_S 0  /* запасной рычаг: доп. пауза после готовности игры. Если вдруг вернутся вылеты на старте — собрать с -DNEAR_EXTRA_DELAY_S=10 */
 #endif
 #ifndef NEAR_SETTLE_S
-#define NEAR_SETTLE_S 12      /* сколько секунд после появления libil2cpp.so мод НЕ вызывает ни одной её функции (идёт il2cpp_init). Можно менять файлом HLOG/near_delay.txt (число секунд) без пересборки */
+#define NEAR_SETTLE_S 3       /* (было 12; с near_delay.txt=1 проверено — работает, 3 — с запасом) */
+/* сколько секунд после появления libil2cpp.so мод НЕ вызывает ни одной её функции (идёт il2cpp_init). Можно менять файлом HLOG/near_delay.txt (число секунд) без пересборки */
 #endif
 #define POLL_US 250000        /* период лёгкого опроса готовности */
 
@@ -872,24 +873,12 @@ static void respond(int fd, const char* status, const char* ctype, const char* b
 
 static char g_diag_out[24576 + 1024];
 
-/* ───────────── реконнект: GET /rec?t=N ─────────────
+/* ───────────── реконнект (нативная команда /rec) ─────────────
    Повторяет Hassle::Commands::Reconnect оригинального libHassleExtended (/rec): берёт Game.Network (static), читает
    m_Host/m_Port/m_Password/m_NickName, вызывает OnApplicationQuit() (посылает ID_DISCONNECTION_NOTIFICATION, если State == 2)
    и DelayedConnect(host, port, password, nick, секунды) — внутри UniTask.Delay(N) и затем NetworkClient.Connect(...). */
 static long g_recUntil;                 /* до какого времени (time()) предыдущий реконнект ещё «в работе» */
-static char g_rec_out[1024];
 
-static int query_int(const char* rq, const char* key, int dflt) {
-    const char* q; unsigned kl = slen(key);
-    for (q = rq; *q && *q != '\r' && *q != '\n'; q++) {
-        if ((*q == '?' || *q == '&') && sprefix(q + 1, key) && q[1 + kl] == '=') {
-            int v = 0, d = 0; const char* p = q + 2 + kl;
-            while (*p >= '0' && *p <= '9' && v < 100000) { v = v * 10 + (*p - '0'); p++; d++; }
-            return d ? v : dflt;
-        }
-    }
-    return dflt;
-}
 static void exc_text(void* exc, char* out, int cap) {
     void* m; void* e2 = NULL; void* s;
     out[0] = 0;
@@ -906,6 +895,45 @@ static void rec_set(RecRes* r, const char* why) {
     for (; why[i] && i < sizeof r->why - 1; i++) r->why[i] = why[i];
     r->why[i] = 0; r->ok = 0;
     dlog2("реконнект: отказ: ", r->why);
+}
+
+/* ── Немедленный разрыв соединения через RakNet (как делала сборка от 21.10 10:31) ──
+   OnApplicationQuit() сам шлёт серверу уведомление об отключении только при State == Connected. Чтобы сервер и игра сразу
+   увидели разрыв («Вы были отключены от сервера»), закрываем все соединения RakPeer штатным CloseConnection с уведомлением:
+   Game.Network.m_RakNet._nativeClient = RakPeer*; libRakNet.so: RakPeer::GetConnectionList + RakPeer::CloseConnection. */
+typedef struct { unsigned long long g; u16 si; } RakGuid;                       /* RakNetGUID: 16 байт */
+typedef struct { u8 addr[16]; u16 dport; u16 sidx; } RakSysAddr;                /* SystemAddress без IPv6: 20 байт */
+typedef struct { RakGuid guid; RakSysAddr addr; } RakAOG;                       /* AddressOrGUID: 40 байт, передаётся по значению */
+typedef int  (*rak_getlist_t)(void* peer, RakSysAddr* out, u16* num);
+typedef void (*rak_close_t)(void* peer, RakAOG target, u8 notify, u8 channel, int prio);
+
+static void rak_close_all(void* nc) {
+    void *rk, *peer, *h; rak_getlist_t gl = NULL; rak_close_t cl = NULL; const RakGuid* ug = NULL;
+    RakSysAddr list[8]; u16 num = 8; int i, n, closed = 0;
+    rk = ref_field(nc, "m_RakNet");
+    if (!rk) { dlog("реконнект: Game.Network.m_RakNet не найден или пуст"); return; }
+    peer = ref_field(rk, "_nativeClient");
+    if (!peer) { dlog("реконнект: m_RakNet._nativeClient пуст"); return; }
+    h = dlopen("libRakNet.so", RTLD_NOW_ | 4);                                  /* RTLD_NOLOAD: только если уже загружена */
+    if (!h) { dlog("реконнект: libRakNet.so / GetConnectionList недоступны"); return; }
+    *(void**)&gl = dlsym(h, "_ZNK6RakNet7RakPeer17GetConnectionListEPNS_13SystemAddressEPt");
+    *(void**)&cl = dlsym(h, "_ZN6RakNet7RakPeer15CloseConnectionENS_13AddressOrGUIDEbh14PacketPriority");
+    ug = (const RakGuid*)dlsym(h, "_ZN6RakNet22UNASSIGNED_RAKNET_GUIDE");
+    if (!gl) { dlog("реконнект: libRakNet.so / GetConnectionList недоступны"); return; }
+    if (!cl) { dlog("реконнект: RakPeer::CloseConnection не найден в libRakNet.so"); return; }
+    { unsigned k; for (k = 0; k < sizeof list; k++) ((u8*)list)[k] = 0; }
+    gl(peer, list, &num);
+    n = num > 8 ? 8 : (int)num;
+    dlog_i("реконнект: активных соединений RakNet: ", n);
+    for (i = 0; i < n; i++) {
+        RakAOG a; unsigned k;
+        for (k = 0; k < sizeof a; k++) ((u8*)&a)[k] = 0;
+        if (ug) a.guid = *ug; else { a.guid.g = ~0ULL; a.guid.si = 0xFFFF; }
+        a.addr = list[i];
+        cl(peer, a, 1, 0, 0);                                                   /* уведомить сервер, канал 0, IMMEDIATE_PRIORITY */
+        closed++;
+    }
+    dlog_i("реконнект: закрыто соединений: ", closed);
 }
 
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
@@ -947,6 +975,9 @@ static void do_reconnect(int t, RecRes* r) {
     dlog_i("реконнект: State ", state);
     dlog_i("реконнект: порт ", port);
 
+    /* 0) сразу рвём RakNet-соединения с уведомлением серверу (до OnApplicationQuit — как в сборке, где «отключены от сервера» писалось) */
+    rak_close_all(nc);
+
     /* 1) корректный выход с сервера (внутри сам проверяет State == Connected) */
     exc = NULL;
     A.runtime_invoke(mq, nc, NULL, &exc);
@@ -977,24 +1008,6 @@ static void do_reconnect(int t, RecRes* r) {
     g_recUntil = now + t + 3;
     r->ok = 1; r->state = state; r->port = port;
     dlog("реконнект: DelayedConnect запущен");
-}
-
-static void handle_rec(int c, const char* rq) {
-    RecRes r; Buf b;
-    do_reconnect(query_int(rq, "t", 0), &r);
-    b_init(&b, g_rec_out, sizeof g_rec_out);
-    if (r.ok) {
-        b_s(&b, "{\"ok\":1,\"t\":"); b_int(&b, r.t);
-        b_s(&b, ",\"state\":"); b_int(&b, r.state);
-        b_s(&b, ",\"port\":"); b_int(&b, r.port);
-        b_s(&b, ",\"quit\":"); b_int(&b, r.quit);
-        b_ch(&b, '}');
-    } else {
-        b_s(&b, "{\"ok\":0,\"why\":"); b_jstr(&b, r.why);
-        if (r.exc[0]) { b_s(&b, ",\"exc\":"); b_jstr(&b, r.exc); }
-        b_ch(&b, '}');
-    }
-    respond(c, "200 OK", "application/json", g_rec_out, b.n);
 }
 
 /* ───────────── нативная чат-команда /rec (без rec.js и без портов) ─────────────
@@ -1104,7 +1117,7 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
     chat_say(msg);
 }
 
-static void cmd_fail(const char* why) { g_cmdDone = -1; dlog2("нативная /rec: не получилось, остаётся HTTP+rec.js. Причина: ", why); }
+static void cmd_fail(const char* why) { g_cmdDone = -1; dlog2("нативная /rec: не получилось. Причина: ", why); }
 static int cmd_put(void* dict, void* setitem, const char* key, void* del) {
     void* args[2]; void* exc = NULL; char et[256];
     args[0] = A.string_new(key); args[1] = del;
@@ -1193,7 +1206,6 @@ static void* server_main(void* arg) {
                 { static int hl; if (hl < 15) { char q[48]; int k; hl++; for (k = 0; k < 47 && rq[k] && rq[k] != '\r' && rq[k] != '\n'; k++) q[k] = rq[k]; q[k] = 0; dlog2("HTTP: запрос ", q); } }
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
-                else if (sprefix(rq, "GET /rec")) handle_rec(c, rq);
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);
                 else respond(c, "404 Not Found", "text/plain", "no", 2);
