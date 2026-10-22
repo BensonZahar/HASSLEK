@@ -936,23 +936,46 @@ static void rak_close_all(void* nc) {
     dlog_i("реконнект: закрыто соединений: ", closed);
 }
 
-/* ── Камера → стоковое состояние при /rec, БЕЗ загрузки чего-либо ──
-   Стоковая камера — та, что игра сама ставит при старте (Game.OnLoadingFinished) и при RequestSpawn: MainCamera.SetMode(CameraMode.None = 0).
-   SetMode(None) вызывает приватный ResetTarget(): камера отцепляется от персонажа/машины (Ped=1 / Vehicle=2 ставит SetTarget в
-   LocalPlayer.OnCharacterStarted и Drive.OnGetInFinish). После реконнекта сервер сам ставит свою камеру (auth-сцена: InterpolateCameraPos),
-   а при спавне SetTarget(Ped) вернёт слежение. Game.Reset() не вызываем — он грузит/сбрасывает лишнее и зовётся только из PacketReceive. */
+/* ── Камера → «в воздух», как при заходе в игру, БЕЗ загрузки чего-либо ──
+   При входе камера висит в воздухе (мир не рендерится). Повторяем это на /rec в три лёгких шага (всё в главном потоке, исключения
+   гасим, при любой неудаче просто выходим):
+     1) MainCamera.SetMode(None = 0) — как Game.OnLoadingFinished / RequestSpawn: ResetTarget(), камера отцеплена от персонажа/машины;
+     2) get_Position() — где камера сейчас; SetPosition(она + REC_CAM_UP по Y) — поднимаем простую камеру высоко вверх;
+     3) SetLookPosition(точка на той же высоте впереди) — смотрим горизонтально, в небо.
+   После реконнекта сервер ставит свою камеру (auth-сцена: InterpolateCameraPos), при спавне SetTarget(Ped) вернёт слежение.
+   Game.Reset() не вызываем — он зовётся только из PacketReceive и сбрасывает/грузит лишнее. */
+#define REC_CAM_UP 3000.0f
 static void rec_camera_stock(void) {
-    void *fn, *cam = NULL, *m, *exc = NULL; int mode = 0;
+    void *fn, *cam = NULL, *k, *m, *exc = NULL, *ret; int mode = 0; float p[3], l[3]; char et[256];
     if (!g_cGame) return;
     fn = A.class_get_field_from_name(g_cGame, "MainCamera");
     if (!fn) { dlog("реконнект: Game.MainCamera не найдено — камеру не трогаем"); return; }
     A.field_static_get_value(fn, &cam);
     if (!cam) { dlog("реконнект: Game.MainCamera = null — камеру не трогаем"); return; }
-    m = find_method(A.object_get_class(cam), "SetMode", 1);
+    k = A.object_get_class(cam);
+
+    m = find_method(k, "SetMode", 1);
     if (!m) { dlog("реконнект: MainCamera.SetMode не найден"); return; }
     { void* a[1]; a[0] = &mode; A.runtime_invoke(m, cam, a, &exc); }
-    if (exc) { char et[256]; exc_text(exc, et, sizeof et); dlog2("реконнект: MainCamera.SetMode(None) бросил: ", et); return; }
-    dlog("реконнект: камера → стоковая (SetMode None)");
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: MainCamera.SetMode(None) бросил: ", et); return; }
+
+    m = find_method(k, "get_Position", 0);
+    if (!m) { dlog("реконнект: MainCamera.get_Position не найден — камера только отцеплена"); return; }
+    exc = NULL; ret = A.runtime_invoke(m, cam, NULL, &exc);
+    if (exc || !ret) { dlog("реконнект: get_Position не удался — камера только отцеплена"); return; }
+    { const float* v = (const float*)((char*)ret + 2 * sizeof(void*));          /* упакованный Vector3: данные сразу за заголовком объекта */
+      p[0] = v[0]; p[1] = v[1] + REC_CAM_UP; p[2] = v[2];
+      if (!(p[0] == p[0]) || !(p[1] == p[1]) || !(p[2] == p[2])) { dlog("реконнект: позиция камеры не число — камера только отцеплена"); return; } }
+    l[0] = p[0]; l[1] = p[1]; l[2] = p[2] + 100.0f;
+
+    m = find_method(k, "SetPosition", 1);
+    if (m) { void* a[1]; a[0] = p; exc = NULL; A.runtime_invoke(m, cam, a, &exc);
+             if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: MainCamera.SetPosition бросил: ", et); return; } }
+    else { dlog("реконнект: MainCamera.SetPosition не найден"); return; }
+    m = find_method(k, "SetLookPosition", 1);
+    if (m) { void* a[1]; a[0] = l; exc = NULL; A.runtime_invoke(m, cam, a, &exc);
+             if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: MainCamera.SetLookPosition бросил: ", et); return; } }
+    dlog("реконнект: камера поднята в воздух (SetMode None + SetPosition/SetLookPosition)");
 }
 
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
