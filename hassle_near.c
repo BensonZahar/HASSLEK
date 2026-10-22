@@ -937,23 +937,22 @@ static void rak_close_all(void* nc) {
 }
 
 /* ── Камера → стоковое состояние при /rec, БЕЗ загрузки чего-либо ──
-   Game.Reset() и пересоздание сцены не вызываем (это и есть «нагрузка»). Только лёгкие сеттеры Hassle.Graphics.MainCamera:
-   дистанция и смещение цели — по умолчанию, FOV — DefaultFieldOfView (45). Каждый вызов в try: исключение игнорируем. */
+   Стоковая камера — та, что игра сама ставит при старте (Game.OnLoadingFinished) и при RequestSpawn: MainCamera.SetMode(CameraMode.None = 0).
+   SetMode(None) вызывает приватный ResetTarget(): камера отцепляется от персонажа/машины (Ped=1 / Vehicle=2 ставит SetTarget в
+   LocalPlayer.OnCharacterStarted и Drive.OnGetInFinish). После реконнекта сервер сам ставит свою камеру (auth-сцена: InterpolateCameraPos),
+   а при спавне SetTarget(Ped) вернёт слежение. Game.Reset() не вызываем — он грузит/сбрасывает лишнее и зовётся только из PacketReceive. */
 static void rec_camera_stock(void) {
-    void *fn, *cam = NULL, *k, *m, *exc; float fov = 45.0f;
+    void *fn, *cam = NULL, *m, *exc = NULL; int mode = 0;
     if (!g_cGame) return;
     fn = A.class_get_field_from_name(g_cGame, "MainCamera");
     if (!fn) { dlog("реконнект: Game.MainCamera не найдено — камеру не трогаем"); return; }
     A.field_static_get_value(fn, &cam);
     if (!cam) { dlog("реконнект: Game.MainCamera = null — камеру не трогаем"); return; }
-    k = A.object_get_class(cam);
-    m = find_method(k, "ResetDistanceToDefault", 0);
-    if (m) { exc = NULL; A.runtime_invoke(m, cam, NULL, &exc); }
-    m = find_method(k, "ResetTargetOffsetToDefault", 0);
-    if (m) { exc = NULL; A.runtime_invoke(m, cam, NULL, &exc); }
-    m = find_method(k, "set_FieldOfView", 1);
-    if (m) { void* a[1]; a[0] = &fov; exc = NULL; A.runtime_invoke(m, cam, a, &exc); }
-    dlog("реконнект: камера возвращена в стоковое состояние");
+    m = find_method(A.object_get_class(cam), "SetMode", 1);
+    if (!m) { dlog("реконнект: MainCamera.SetMode не найден"); return; }
+    { void* a[1]; a[0] = &mode; A.runtime_invoke(m, cam, a, &exc); }
+    if (exc) { char et[256]; exc_text(exc, et, sizeof et); dlog2("реконнект: MainCamera.SetMode(None) бросил: ", et); return; }
+    dlog("реконнект: камера → стоковая (SetMode None)");
 }
 
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
