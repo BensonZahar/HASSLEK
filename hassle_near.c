@@ -69,7 +69,7 @@ extern char* dlerror(void);
 #define NEAR_EXTRA_DELAY_S 0  /* запасной рычаг: доп. пауза после готовности игры. Если вдруг вернутся вылеты на старте — собрать с -DNEAR_EXTRA_DELAY_S=10 */
 #endif
 #ifndef NEAR_SETTLE_S
-#define NEAR_SETTLE_S 3       /* (было 12; с near_delay.txt=1 проверено — работает, 3 — с запасом) */
+#define NEAR_SETTLE_S 12      /* (пробовали 1 и 3 — иногда вылетало на старте, вернули 12) */
 /* сколько секунд после появления libil2cpp.so мод НЕ вызывает ни одной её функции (идёт il2cpp_init). Можно менять файлом HLOG/near_delay.txt (число секунд) без пересборки */
 #endif
 #define POLL_US 250000        /* период лёгкого опроса готовности */
