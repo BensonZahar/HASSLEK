@@ -1019,11 +1019,14 @@ static void do_reconnect(int t, RecRes* r) {
     /* 1) корректный выход с сервера (внутри сам проверяет State == Connected).
        Как в оригинальном libHassleExtended (HassleRec): OnApplicationQuit → DelayedConnect.
        Game.Reset() НЕ вызываем (нагружает, на прошлом клиенте игра вылетала спустя время); кулдауна между /rec нет, как в оригинале;
-       прямой разрыв через RakNet (rak_close_all) и камера (rec_camera_stock) из /rec убраны. */
+       прямой разрыв через RakNet (rak_close_all) из /rec убран; камера (rec_camera_stock) возвращена. */
     exc = NULL;
     A.runtime_invoke(mq, nc, NULL, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
     else r->quit = 1;
+
+    /* 1б) камера — в стоковое (лёгкие сеттеры, ничего не грузим) */
+    rec_camera_stock();
 
     /* 2) подключение через N секунд (внутри UniTask.Delay(N), затем NetworkClient.Connect) */
     port16 = (unsigned short)port; tf = (float)t;
