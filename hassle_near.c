@@ -13,9 +13,9 @@
  *     последнего пакета синхронизации, HP/броню, пинг и счёт.
  *   • Второй поток — крошечный HTTP-сервер на 127.0.0.1:17771 (порты 17771..17780). HUD (Code3.js) опрашивает
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
- *   • Реконнект — только нативная чат-команда /rec [секунд] (HTTP-эндпоинта /rec больше нет): Game.Network.OnApplicationQuit()
- *     (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
- *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N).
+ *   • Реконнект — только нативная чат-команда /rec [секунд 0–600] (HTTP-эндпоинта /rec больше нет), как в оригинальном libHassleExtended:
+ *     Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
+ *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). Game.Reset() сознательно не вызывается.
  *
  * Версия без паузы и без JS для /rec:
  *   • Вместо слепых 60 секунд сборщик ждёт РЕАЛЬНУЮ готовность игры: libil2cpp загружена → виден Assembly-CSharp →
@@ -877,7 +877,8 @@ static char g_diag_out[24576 + 1024];
    Повторяет Hassle::Commands::Reconnect оригинального libHassleExtended (/rec): берёт Game.Network (static), читает
    m_Host/m_Port/m_Password/m_NickName, вызывает OnApplicationQuit() (посылает ID_DISCONNECTION_NOTIFICATION, если State == 2)
    и DelayedConnect(host, port, password, nick, секунды) — внутри UniTask.Delay(N) и затем NetworkClient.Connect(...). */
-static long g_recUntil;                 /* до какого времени (time()) предыдущий реконнект ещё «в работе» */
+#define REC_MIN_S 0                     /* можно и совсем быстрый /rec (0–2 с), в оригинале было от 5 */
+#define REC_MAX_S 600
 
 static void exc_text(void* exc, char* out, int cap) {
     void* m; void* e2 = NULL; void* s;
@@ -983,15 +984,14 @@ static void rec_camera_stock(void) {
 static void do_reconnect(int t, RecRes* r) {
     int state = -1, port = 0, ok = 0;
     void *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL, *host, *pw, *nick;
-    unsigned short port16; float tf; char et[256]; long now;
+    unsigned short port16; float tf; char et[256];
 
     r->ok = 0; r->state = -1; r->port = 0; r->quit = 0; r->why[0] = 0; r->exc[0] = 0;
-    if (t < 0) t = 0;                                   /* потолка нет: любое число секунд из команды (парсер сам режет разбор на 100000) */
+    if (t < REC_MIN_S) t = REC_MIN_S;                   /* диапазон 0–600 */
+    if (t > REC_MAX_S) t = REC_MAX_S;
     r->t = t;
     if (!g_safe) { rec_set(r, "мод Near ещё стартует (ждёт конца загрузки IL2CPP), подождите"); return; }
     if (!il2cpp_light()) { rec_set(r, "IL2CPP ещё не готов (игра грузится, подождите)"); return; }
-    now = time(NULL);
-    if (now < g_recUntil) { rec_set(r, "реконнект уже запущен, подождите"); return; }
     ensure_attached();
 
     if (!g_cGame) g_cGame = A.class_from_name(g_img, "Hassle", "Game");
@@ -1016,19 +1016,16 @@ static void do_reconnect(int t, RecRes* r) {
     dlog_i("реконнект: State ", state);
     dlog_i("реконнект: порт ", port);
 
-    /* 0) сразу рвём RakNet-соединения с уведомлением серверу (до OnApplicationQuit — как в сборке, где «отключены от сервера» писалось) */
-    rak_close_all(nc);
-
-    /* 1) корректный выход с сервера (внутри сам проверяет State == Connected) */
+    /* 1) корректный выход с сервера (внутри сам проверяет State == Connected).
+       Как в оригинальном libHassleExtended (HassleRec): OnApplicationQuit → DelayedConnect.
+       Game.Reset() НЕ вызываем (нагружает, на прошлом клиенте игра вылетала спустя время); кулдауна между /rec нет, как в оригинале;
+       прямой разрыв через RakNet (rak_close_all) и камера (rec_camera_stock) из /rec убраны. */
     exc = NULL;
     A.runtime_invoke(mq, nc, NULL, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
     else r->quit = 1;
 
-    /* 1б) камера — в стоковое (лёгкие сеттеры, ничего не грузим) */
-    rec_camera_stock();
-
-    /* 2) подключение через N секунд */
+    /* 2) подключение через N секунд (внутри UniTask.Delay(N), затем NetworkClient.Connect) */
     port16 = (unsigned short)port; tf = (float)t;
     {
         void* args[5];
@@ -1049,7 +1046,6 @@ static void do_reconnect(int t, RecRes* r) {
         { unsigned i = 0; for (; et[i] && i < sizeof r->exc - 1; i++) r->exc[i] = et[i]; r->exc[i] = 0; }
         return;
     }
-    g_recUntil = now + t + 3;
     r->ok = 1; r->state = state; r->port = port;
     dlog("реконнект: DelayedConnect запущен");
 }
@@ -1154,7 +1150,11 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
         chat_say(msg);
         return;
     }
-    if (t < 0) t = 5;                                   /* как в rec.js: по умолчанию 5 секунд */
+    if (t < 0) t = 5;                                   /* без аргумента — 5 секунд */
+    if (t < REC_MIN_S || t > REC_MAX_S) {               /* допустимо 0–600 */
+        chat_say("Используйте: /rec [секунды (0-600]");
+        return;
+    }
     do_reconnect(t, &r);
     if (r.ok) return;                                   /* успех — в чат ничего не пишем */
     b_s(&b, "Реконнект: "); b_s(&b, r.why);             /* ошибку оставляем, чтобы было видно причину */
