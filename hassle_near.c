@@ -936,6 +936,26 @@ static void rak_close_all(void* nc) {
     dlog_i("реконнект: закрыто соединений: ", closed);
 }
 
+/* ── Камера → стоковое состояние при /rec, БЕЗ загрузки чего-либо ──
+   Game.Reset() и пересоздание сцены не вызываем (это и есть «нагрузка»). Только лёгкие сеттеры Hassle.Graphics.MainCamera:
+   дистанция и смещение цели — по умолчанию, FOV — DefaultFieldOfView (45). Каждый вызов в try: исключение игнорируем. */
+static void rec_camera_stock(void) {
+    void *fn, *cam = NULL, *k, *m, *exc; float fov = 45.0f;
+    if (!g_cGame) return;
+    fn = A.class_get_field_from_name(g_cGame, "MainCamera");
+    if (!fn) { dlog("реконнект: Game.MainCamera не найдено — камеру не трогаем"); return; }
+    A.field_static_get_value(fn, &cam);
+    if (!cam) { dlog("реконнект: Game.MainCamera = null — камеру не трогаем"); return; }
+    k = A.object_get_class(cam);
+    m = find_method(k, "ResetDistanceToDefault", 0);
+    if (m) { exc = NULL; A.runtime_invoke(m, cam, NULL, &exc); }
+    m = find_method(k, "ResetTargetOffsetToDefault", 0);
+    if (m) { exc = NULL; A.runtime_invoke(m, cam, NULL, &exc); }
+    m = find_method(k, "set_FieldOfView", 1);
+    if (m) { void* a[1]; a[0] = &fov; exc = NULL; A.runtime_invoke(m, cam, a, &exc); }
+    dlog("реконнект: камера возвращена в стоковое состояние");
+}
+
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
    тогда, когда игра уже идёт, поэтому ждать сборщика (бывшие 60 секунд) не нужно. */
 static void do_reconnect(int t, RecRes* r) {
@@ -944,8 +964,7 @@ static void do_reconnect(int t, RecRes* r) {
     unsigned short port16; float tf; char et[256]; long now;
 
     r->ok = 0; r->state = -1; r->port = 0; r->quit = 0; r->why[0] = 0; r->exc[0] = 0;
-    if (t < 0) t = 0;
-    if (t > 600) t = 600;
+    if (t < 0) t = 0;                                   /* потолка нет: любое число секунд из команды (парсер сам режет разбор на 100000) */
     r->t = t;
     if (!g_safe) { rec_set(r, "мод Near ещё стартует (ждёт конца загрузки IL2CPP), подождите"); return; }
     if (!il2cpp_light()) { rec_set(r, "IL2CPP ещё не готов (игра грузится, подождите)"); return; }
@@ -983,6 +1002,9 @@ static void do_reconnect(int t, RecRes* r) {
     A.runtime_invoke(mq, nc, NULL, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
     else r->quit = 1;
+
+    /* 1б) камера — в стоковое (лёгкие сеттеры, ничего не грузим) */
+    rec_camera_stock();
 
     /* 2) подключение через N секунд */
     port16 = (unsigned short)port; tf = (float)t;
