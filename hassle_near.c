@@ -24,6 +24,11 @@
  *   • Нативная чат-команда: мод регистрирует «/rec» прямо в реестре команд игры (WebViewSystem.m_ChatCommandEvents), так что
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr.
  *
+ * /nocol — отключить столкновения со всеми игроками и NPC (только на вашем клиенте, сервер ничего не знает).
+ *   Игроки — PlayerPool.PlayersInStream, NPC — Pools.Actors (RPC Hassle.Global.NPC создаёт Actor'ов). Берём капсулу каждого
+ *   (Character.Movement/SimpleMovement → _capsuleCollider / m_Collider) и в главном потоке зовём у вашего движения
+ *   IgnoreCollision(Collider, true) + Physics.IgnoreCollision. По слою нельзя: у игры нет слоя «персонажи» (капсулы на Default вместе с миром).
+ *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
  * Код не использует libc-заголовки: прототипы объявлены вручную, поэтому собирается обычным clang без NDK.
  */
@@ -254,6 +259,11 @@ static struct {
     void* (*string_new)(const char*);
     void* (*object_new)(void*);
     int (*class_instance_size)(void*);
+    /* необязательные (нужны только для /nocol) */
+    void* (*class_get_methods)(void*, void**);
+    const char* (*method_get_name)(void*);
+    unsigned (*method_get_param_count)(void*);
+    void* (*method_get_param)(void*, unsigned);
 } A;
 
 static void* g_il2cpp;
@@ -282,6 +292,10 @@ static int il2cpp_open(void) {
     *(void**)&A.string_new = dlsym(g_il2cpp, "il2cpp_string_new");
     *(void**)&A.object_new = dlsym(g_il2cpp, "il2cpp_object_new");
     *(void**)&A.class_instance_size = dlsym(g_il2cpp, "il2cpp_class_instance_size");
+    *(void**)&A.class_get_methods = dlsym(g_il2cpp, "il2cpp_class_get_methods");
+    *(void**)&A.method_get_name = dlsym(g_il2cpp, "il2cpp_method_get_name");
+    *(void**)&A.method_get_param_count = dlsym(g_il2cpp, "il2cpp_method_get_param_count");
+    *(void**)&A.method_get_param = dlsym(g_il2cpp, "il2cpp_method_get_param");
     if (missing) { dlog2("нет функции il2cpp_", missing); g_il2cpp = NULL; return 0; }
     return 1;
 }
@@ -458,6 +472,16 @@ static void* current_pool(void) {
     if (g_poolSrcIsPools) return ref_field(v, "Players");
     return v;
 }
+/* Pools.Actors (ActorPool : BasePool<Actor>) — сюда RPC Hassle.Global.NPC.Create кладёт NPC. Поле может быть static или лежать в экземпляре Pools. */
+static void* current_actor_pool(void) {
+    void* f; void* v = NULL;
+    if (!g_cPools) return NULL;
+    f = A.class_get_field_from_name(g_cPools, "Actors");
+    if (!f) return NULL;
+    if (A.field_get_flags(f) & 0x10) { A.field_static_get_value(f, &v); return v; }
+    if (g_poolSrcField && g_poolSrcIsPools) { A.field_static_get_value(g_poolSrcField, &v); return ref_field(v, "Actors"); }
+    return NULL;
+}
 static void scan_for_pool(void) {
     uptr n, i;
     void* it; void* f;
@@ -539,12 +563,12 @@ static int int_field(void* o, const char* a, const char* b, const char* c, int d
     return dflt;
 }
 static char g_collKind[96];
-static int walk_collection(void* coll, item_cb cb, void* ctx) {
+static int walk_collection_x(void* coll, item_cb cb, void* ctx, int quiet) {
     void* k; const char* nm; void* arr;
     if (!coll) return 0;
     k = A.object_get_class(coll);
     nm = A.class_get_name(k);
-    if (!seq(g_collKind, nm)) { unsigned i; for (i = 0; i < 95 && nm[i]; i++) g_collKind[i] = nm[i]; g_collKind[i] = 0; dlog2("PlayersInStream: тип ", nm); }
+    if (!quiet && !seq(g_collKind, nm)) { unsigned i; for (i = 0; i < 95 && nm[i]; i++) g_collKind[i] = nm[i]; g_collKind[i] = 0; dlog2("PlayersInStream: тип ", nm); }
     if (ends_with(nm, "[]")) { walk_ref_array(coll, -1, 1, cb, ctx); return 1; }
     if (sprefix(nm, "List`1")) {
         arr = ref_field(coll, "_items"); if (!arr) arr = ref_field(coll, "items");
@@ -561,9 +585,10 @@ static int walk_collection(void* coll, item_cb cb, void* ctx) {
         arr = ref_field(coll, "_entries"); if (!arr) arr = ref_field(coll, "m_slots"); if (!arr) arr = ref_field(coll, "_slots");
         if (arr) { walk_struct_array(arr, int_field(coll, "_count", "m_lastIndex", "_lastIndex", -1), "value", cb, ctx); return 1; }
     }
-    if (!g_fieldsDumped) dump_class(k, "PlayersInStream (неизвестный тип коллекции)");
+    if (!quiet && !g_fieldsDumped) dump_class(k, "PlayersInStream (неизвестный тип коллекции)");
     return 0;
 }
+static int walk_collection(void* coll, item_cb cb, void* ctx) { return walk_collection_x(coll, cb, ctx, 0); }
 
 /* ───────────── чтение игроков ───────────── */
 typedef struct {
@@ -1242,6 +1267,268 @@ static void native_nearlog_cmd(void* self, void* args, void* mi) {
     dlog_i("нативная /nearlog: снимков ", t);
 }
 
+
+/* ───────────── /nocol: проходить сквозь игроков и NPC ─────────────
+   /nocol            — переключить (вкл ↔ выкл)
+   /nocol on | off   — включить «без столкновений» / вернуть как было (on повторно — захватить тех, кто появился позже)
+   /nocol status     — текущее состояние
+   Всё выполняется в главном потоке Unity (нативные вызовы Physics из фонового потока небезопасны). Действует только на вашем клиенте.
+   Ограничение: новые игроки/NPC, вошедшие в зону после команды, не захватываются сами — повторите /nocol on. После респавна — тоже. */
+#define NC_MAXT 640
+static void* g_nc_t[NC_MAXT];
+static int g_nc_nt;
+static void* g_nc_me;
+static int g_nc_on, g_nc_lastP, g_nc_lastA, g_nc_lastC, g_nc_logged, g_nc_physTried, g_nc_ctrlDumped;
+static void* g_mPhysIgnore;                        /* Physics.IgnoreCollision(Collider, Collider, bool) */
+static void* g_nc_cacheCls[6]; static void* g_nc_cacheM[6]; static int g_nc_cacheN;
+
+typedef struct { int players, actors, cols, ign_ok, ign_exc, phys_ok, phys_exc; char err[160]; char exc[240]; } NcRes;
+static void nc_err(NcRes* r, const char* why) {
+    unsigned i = 0;
+    for (; why[i] && i < sizeof r->err - 1; i++) r->err[i] = why[i];
+    r->err[i] = 0;
+    dlog2("нативная /nocol: отказ: ", r->err);
+}
+
+static void* find_image_pre(const char* pre) {
+    uptr n = 0, i; void** as;
+    if (!g_domain) return NULL;
+    as = A.domain_get_assemblies(g_domain, &n);
+    for (i = 0; as && i < n; i++) {
+        void* img = A.assembly_get_image(as[i]);
+        const char* nm = img ? A.image_get_name(img) : NULL;
+        if (nm && sprefix(nm, pre)) return img;
+    }
+    return NULL;
+}
+/* метод по имени, числу параметров и суффиксу типа первого параметра: у движения две перегрузки IgnoreCollision(Collider|Rigidbody, bool),
+   а class_get_method_from_name вернул бы любую из них — подсунуть Collider в параметр Rigidbody нельзя */
+static void* find_method_p(void* k, const char* name, int argc, const char* p0suffix) {
+    for (; k; k = A.class_get_parent(k)) {
+        void* it = NULL; void* m;
+        while ((m = A.class_get_methods(k, &it))) {
+            const char* mn = A.method_get_name(m); void* t; const char* tn;
+            if (!mn || !seq(mn, name)) continue;
+            if ((int)A.method_get_param_count(m) != argc) continue;
+            if (!p0suffix) return m;
+            t = A.method_get_param(m, 0);
+            tn = t ? A.type_get_name(t) : NULL;
+            if (tn && ends_with(tn, p0suffix)) return m;
+        }
+    }
+    return NULL;
+}
+static void* nc_ign_method(void* obj) {
+    void* k = A.object_get_class(obj); void* m; int i;
+    for (i = 0; i < g_nc_cacheN; i++) if (g_nc_cacheCls[i] == k) return g_nc_cacheM[i];
+    m = find_method_p(k, "IgnoreCollision", 2, ".Collider");
+    if (g_nc_cacheN < 6) { g_nc_cacheCls[g_nc_cacheN] = k; g_nc_cacheM[g_nc_cacheN] = m; g_nc_cacheN++; }
+    return m;
+}
+
+/* компоненты движения актёра: Actor.m_Controller (Character) → Movement (ECM2 CharacterMovement) и/или SimpleMovement (SimpleCharacterMovement) */
+static int nc_movements(void* actor, void** out, int cap) {
+    static const char* nm[2] = { "Movement", "SimpleMovement" };
+    void* ctrl = ref_field(actor, "m_Controller"); int n = 0, i, j;
+    if (!ctrl) {
+        void* m = find_method(A.object_get_class(actor), "get_Controller", 0);
+        if (m) { void* exc = NULL; ctrl = A.runtime_invoke(m, actor, NULL, &exc); if (exc) ctrl = NULL; }
+    }
+    if (!ctrl) return 0;
+    for (i = 0; i < 2 && n < cap; i++) {
+        void* mv = ref_field(ctrl, nm[i]); int dup = 0;
+        if (!mv) continue;
+        for (j = 0; j < n; j++) if (out[j] == mv) dup = 1;
+        if (!dup) out[n++] = mv;
+    }
+    return n;
+}
+static void* nc_capsule(void* mv) {
+    void* c = ref_field(mv, "_capsuleCollider");       /* ECM2 CharacterMovement */
+    if (!c) c = ref_field(mv, "m_Collider");           /* SimpleCharacterMovement */
+    return c;
+}
+/* коллайдер жив и его объект активен (Physics.IgnoreCollision на неактивных ругается ошибкой в логе Unity) */
+static int nc_active(void* col) {
+    void* m; void* go; void* r; void* exc = NULL;
+    m = find_method(A.object_get_class(col), "get_gameObject", 0);
+    if (!m) return 1;
+    go = A.runtime_invoke(m, col, NULL, &exc);
+    if (exc || !go) return 0;
+    m = find_method(A.object_get_class(go), "get_activeInHierarchy", 0);
+    if (!m) return 1;
+    exc = NULL; r = A.runtime_invoke(m, go, NULL, &exc);
+    if (exc || !r) return 0;
+    return *((u8*)r + HDR) ? 1 : 0;
+}
+static void nc_collect_cb(void* item, void* ctx) {
+    (void)ctx;
+    if (!item || item == g_nc_me || g_nc_nt >= NC_MAXT) return;
+    g_nc_t[g_nc_nt++] = item;
+}
+static void nc_call_ign(void* m, void* obj, void* col, u8 ign, NcRes* r) {
+    void* args[2]; void* exc = NULL;
+    args[0] = col; args[1] = &ign;
+    A.runtime_invoke(m, obj, args, &exc);
+    if (exc) { r->ign_exc++; if (!r->exc[0]) exc_text(exc, r->exc, sizeof r->exc); }
+    else r->ign_ok++;
+}
+static void nc_call_phys(void* a, void* b, u8 ign, NcRes* r) {
+    void* args[3]; void* exc = NULL;
+    if (!g_mPhysIgnore || !a || !b) return;
+    args[0] = a; args[1] = b; args[2] = &ign;
+    A.runtime_invoke(g_mPhysIgnore, NULL, args, &exc);
+    if (exc) r->phys_exc++; else r->phys_ok++;
+}
+
+static void nc_apply(int ignore, NcRes* r) {
+    void *pool, *stream, *apool, *items; void *lmv[2], *lcap[2];
+    int nl, i, t, k, n0; u8 ign = ignore ? 1 : 0;
+    r->players = r->actors = r->cols = r->ign_ok = r->ign_exc = r->phys_ok = r->phys_exc = 0;
+    r->err[0] = 0; r->exc[0] = 0;
+    if (!g_safe) { nc_err(r, "мод Near ещё стартует, подождите"); return; }
+    if (!il2cpp_light()) { nc_err(r, "IL2CPP ещё не готов"); return; }
+    ensure_attached();
+    if (!A.class_get_methods || !A.method_get_name || !A.method_get_param_count || !A.method_get_param) {
+        nc_err(r, "в libil2cpp нет il2cpp_class_get_methods / method_get_param"); return;
+    }
+    if (!g_poolSrcField) { nc_err(r, "пул игроков ещё не найден, подождите пару секунд"); return; }
+    pool = current_pool();
+    if (!pool) { nc_err(r, "вы не в игре (пул игроков не создан)"); return; }
+    g_nc_me = ref_field(pool, "LocalPlayer");
+    if (!g_nc_me) { nc_err(r, "ваш персонаж ещё не создан"); return; }
+    nl = nc_movements(g_nc_me, lmv, 2);
+    if (nl <= 0) {
+        nc_err(r, "у вашего персонажа не найден компонент движения (подробности в near.log)");
+        if (!g_nc_ctrlDumped) {
+            void* ctrl = ref_field(g_nc_me, "m_Controller");
+            g_nc_ctrlDumped = 1;
+            dump_class(ctrl ? A.object_get_class(ctrl) : A.object_get_class(g_nc_me), ctrl ? "контроллер игрока (Character)" : "LocalPlayer (нет m_Controller)");
+        }
+        return;
+    }
+    for (i = 0; i < nl; i++) lcap[i] = nc_capsule(lmv[i]);
+    if (!g_nc_physTried) {
+        void* img = find_image_pre("UnityEngine.PhysicsModule");
+        void* kp = img ? A.class_from_name(img, "UnityEngine", "Physics") : NULL;
+        g_nc_physTried = 1;
+        if (kp) g_mPhysIgnore = A.class_get_method_from_name(kp, "IgnoreCollision", 3);
+        dlog2("нативная /nocol: Physics.IgnoreCollision ", g_mPhysIgnore ? "найден" : "НЕ найден (работаю только через IgnoreCollision движения)");
+    }
+    if (!g_nc_logged) {
+        g_nc_logged = 1;
+        for (i = 0; i < nl; i++) {
+            dlog2("нативная /nocol: движение игрока: ", A.class_get_name(A.object_get_class(lmv[i])));
+            dlog2("нативная /nocol:    его капсула: ", lcap[i] ? A.class_get_name(A.object_get_class(lcap[i])) : "НЕТ");
+            dlog2("нативная /nocol:    IgnoreCollision(Collider,bool): ", nc_ign_method(lmv[i]) ? "найден" : "НЕ найден");
+        }
+    }
+
+    g_nc_nt = 0;
+    stream = ref_field(pool, "PlayersInStream");
+    if (stream) walk_collection_x(stream, nc_collect_cb, NULL, 1);
+    r->players = g_nc_nt; n0 = g_nc_nt;
+    apool = current_actor_pool();
+    if (apool) { items = ref_field(apool, "m_Items"); if (items) walk_collection_x(items, nc_collect_cb, NULL, 1); }
+    r->actors = g_nc_nt - n0;
+
+    for (t = 0; t < g_nc_nt; t++) {
+        void *tm[2], *cols[2]; int nt = nc_movements(g_nc_t[t], tm, 2), nc = 0;
+        for (k = 0; k < nt; k++) {
+            void* c = nc_capsule(tm[k]); int dup = 0, j;
+            if (!c) continue;
+            for (j = 0; j < nc; j++) if (cols[j] == c) dup = 1;
+            if (!dup) cols[nc++] = c;
+        }
+        for (k = 0; k < nc; k++) {
+            if (!nc_active(cols[k])) continue;
+            r->cols++;
+            for (i = 0; i < nl; i++) {
+                void* m;
+                if (cols[k] == lcap[i]) continue;
+                m = nc_ign_method(lmv[i]);                         /* ваше движение игнорирует чужую капсулу */
+                if (m) nc_call_ign(m, lmv[i], cols[k], ign, r);
+                nc_call_phys(lcap[i], cols[k], ign, r);            /* и на уровне физики Unity */
+            }
+        }
+        for (k = 0; k < nt; k++) {                                 /* обратно: движение цели игнорирует вашу капсулу (если она сама толкает вас) */
+            void* tc = nc_capsule(tm[k]); void* m;
+            if (!tc || !nc_active(tc)) continue;                   /* неактивные пропускаем — Unity на них пишет ошибку */
+            m = nc_ign_method(tm[k]);
+            if (!m) continue;
+            for (i = 0; i < nl; i++) if (lcap[i] && lcap[i] != tc) nc_call_ign(m, tm[k], lcap[i], ign, r);
+        }
+    }
+    {
+        char t2[300]; Buf x; b_init(&x, t2, sizeof t2);
+        b_s(&x, "нативная /nocol: "); b_s(&x, ign ? "ВКЛ" : "ВЫКЛ"); b_s(&x, ": игроков "); b_int(&x, r->players);
+        b_s(&x, ", NPC "); b_int(&x, r->actors); b_s(&x, ", капсул "); b_int(&x, r->cols);
+        b_s(&x, ", IgnoreCollision ок/ошибок "); b_int(&x, r->ign_ok); b_ch(&x, '/'); b_int(&x, r->ign_exc);
+        b_s(&x, ", Physics ок/ошибок "); b_int(&x, r->phys_ok); b_ch(&x, '/'); b_int(&x, r->phys_exc);
+        dlog(t2);
+        if (r->exc[0]) dlog2("нативная /nocol: первое исключение: ", r->exc);
+    }
+}
+
+/* слова из аргументов команды (по пробелам, без учёта регистра): 1 — on/1, 2 — off/0, 8 — status/diag */
+static int nc_parse(void* arr) {
+    long len; int i, w = 0; char* data;
+    if (!arr) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return 0;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[96]; int n, p = 0; const u16* ch;
+        if (!s) continue;
+        n = A.string_length(s); ch = A.string_chars(s);
+        if (n <= 0 || n > 60 || !ch) continue;
+        utf16_to_utf8(ch, n, tmp, sizeof tmp);
+        while (tmp[p]) {
+            char tok[24]; int q = 0;
+            while (tmp[p] == ' ') p++;
+            while (tmp[p] && tmp[p] != ' ') { if (q < 23) { char c = tmp[p]; tok[q++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; } p++; }
+            tok[q] = 0;
+            if (seq(tok, "on") || seq(tok, "1")) w |= 1;
+            else if (seq(tok, "off") || seq(tok, "0")) w |= 2;
+            else if (seq(tok, "status") || seq(tok, "diag")) w |= 8;
+        }
+    }
+    return w;
+}
+
+static void native_nocol_cmd(void* self, void* args, void* mi) {
+    int w, want; NcRes r; Buf b; char msg[420];
+    (void)self; (void)mi;
+    w = nc_parse(args);
+    dlog_i("нативная /nocol: вызвана, флаги ", w);
+    b_init(&b, msg, sizeof msg);
+    if (w & 8) {
+        b_s(&b, "Коллизия с игроками и NPC: "); b_s(&b, g_nc_on ? "ВЫКЛЮЧЕНА" : "включена (как в игре)");
+        if (g_nc_on) { b_s(&b, " — игроков "); b_int(&b, g_nc_lastP); b_s(&b, ", NPC "); b_int(&b, g_nc_lastA); b_s(&b, ", капсул "); b_int(&b, g_nc_lastC); }
+        chat_say(msg);
+        return;
+    }
+    want = (w & 2) ? 0 : (w & 1) ? 1 : !g_nc_on;
+    nc_apply(want, &r);
+    if (r.err[0]) { b_s(&b, "Коллизия: не вышло — "); b_s(&b, r.err); chat_say(msg); return; }
+    if (r.cols > 0 && r.ign_ok == 0 && r.phys_ok == 0) {
+        b_s(&b, "Коллизия: вызов не прошёл ("); b_int(&b, r.ign_exc); b_s(&b, " ошибок), подробности в HLOG/near.log");
+        chat_say(msg);
+        return;
+    }
+    g_nc_on = want; g_nc_lastP = r.players; g_nc_lastA = r.actors; g_nc_lastC = r.cols;
+    if (!want) { b_s(&b, "Коллизия с игроками и NPC включена обратно"); chat_say(msg); return; }
+    if (r.cols == 0) {
+        b_s(&b, "Коллизия: рядом нет ни игроков, ни NPC с капсулой. Когда появятся — снова /nocol on");
+        chat_say(msg);
+        return;
+    }
+    b_s(&b, "Коллизия с игроками и NPC ВЫКЛЮЧЕНА: игроков "); b_int(&b, r.players); b_s(&b, ", NPC "); b_int(&b, r.actors);
+    b_s(&b, ". Тех, кто появится позже, добавит повторный /nocol on. Вернуть: /nocol off");
+    chat_say(msg);
+}
+
 static void cmd_fail(const char* why) { g_cmdDone = -1; dlog2("нативная /rec: не получилось. Причина: ", why); }
 static int cmd_put(void* dict, void* setitem, const char* key, void* del) {
     void* args[2]; void* exc = NULL; char et[256];
@@ -1299,6 +1586,9 @@ static void try_register_cmd(void) {
         nd = clone_cmd_delegate(kls, size, off_mp, f_ii ? off_ii : 0, (uptr)native_nearlog_cmd);
         if (nd && (cmd_put(dict, mset, "/nearlog", nd) & cmd_put(dict, mset, "nearlog", nd))) dlog("нативная /nearlog: зарегистрирована («/nearlog» и «nearlog»)");
         else dlog("нативная /nearlog: НЕ зарегистрирована");
+        nd = clone_cmd_delegate(kls, size, off_mp, f_ii ? off_ii : 0, (uptr)native_nocol_cmd);
+        if (nd && (cmd_put(dict, mset, "/nocol", nd) & cmd_put(dict, mset, "nocol", nd))) dlog("нативная /nocol: зарегистрирована («/nocol» и «nocol»)");
+        else dlog("нативная /nocol: НЕ зарегистрирована");
     } else cmd_fail("не удалось записать делегат в реестр");
 }
 
