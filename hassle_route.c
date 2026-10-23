@@ -98,9 +98,15 @@ static long long rt_now(void) {
     return (long long)t.sec * 1000 + t.nsec / 1000000;
 }
 
-/* ───────────── поиск джойстиков (ТОЛЬКО главный поток) ───────────── */
-static void rt_name(void* o, const char* field, char* out, int cap) {
-    void* s = ref_field_s(o, field); int n, i; const u16* ch;
+/* ───────────── поиск джойстиков (ТОЛЬКО главный поток) ─────────────
+   ВАЖНО: VirtualJoystick — НЕ UnityEngine.Object (VirtualControl — обычный абстрактный класс без базы), поэтому
+   FindObjectsOfType(VirtualJoystick) не находит его НИКОГДА — отсюда «Джойстиков: 0», нажат палец или нет.
+   Нарисованный на экране «плавающий» стик (Hud.js: show=false, opacity 0 до касания) на это не влияет: C#-объект создаётся
+   сразу, когда HUD смонтирован (Hud.js mounted(): window.onScreenJoystickCreate("<Gamepad>/leftStick")), и живёт, пока HUD на экране.
+   Настоящий путь к нему:
+     UI.VirtualControls (static)  →  VirtualControlsManager.m_NameVirtualControlsMap (Dictionary<string, VirtualControl>)  →  значения класса VirtualJoystick. */
+static void rt_str(void* s, char* out, int cap) {
+    int n, i; const u16* ch;
     out[0] = 0;
     if (!s || !nc_readable(s, 24)) return;
     n = A.string_length(s); ch = A.string_chars(s);
@@ -108,37 +114,81 @@ static void rt_name(void* o, const char* field, char* out, int cap) {
     utf16_to_utf8(ch, n, out, cap);
     for (i = 0; out[i]; i++) if (out[i] == ' ') out[i] = '_';
 }
+static void rt_name(void* o, const char* field, char* out, int cap) { rt_str(ref_field_s(o, field), out, cap); }
+
+static char g_rt_jkey[RT_MAXJ][64];                                /* ключ словаря, под которым джойстик зарегистрирован (для /route probe) */
+
+static void* rt_manager(void) {                                    /* VirtualControlsManager */
+    void *kui, *m, *mgr = NULL, *exc = NULL; char et[240];
+    kui = A.class_from_name(g_img, "Hassle.Graphics.UserInterfaces", "UI");
+    m = kui ? find_method(kui, "get_VirtualControls", 0) : NULL;
+    if (m) {
+        mgr = A.runtime_invoke(m, NULL, NULL, &exc);
+        if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: UI.VirtualControls бросил: ", et); mgr = NULL; }
+    } else dlog("маршрут: нет UI.get_VirtualControls");
+    if (mgr && nc_obj_ok(mgr)) return mgr;
+    {   /* запасной путь: сам менеджер — MonoBehaviour, его FindObjectsOfType находит */
+        void *kt, *img, *ko, *fm, *tobj, *arr, *args[1]; long len;
+        exc = NULL;
+        kt = A.class_from_name(g_img, "Hassle.Utilities.Input.VirtualControls", "VirtualControlsManager");
+        img = find_image_pre("UnityEngine.CoreModule");
+        ko = img ? A.class_from_name(img, "UnityEngine", "Object") : NULL;
+        fm = ko ? A.class_get_method_from_name(ko, "FindObjectsOfType", 1) : NULL;
+        if (!kt || !fm || !rt_api()) return NULL;
+        tobj = RA.type_get_object(RA.class_get_type(kt));
+        if (!tobj) return NULL;
+        args[0] = tobj;
+        arr = A.runtime_invoke(fm, NULL, args, &exc);
+        if (exc || !arr || !nc_readable(arr, 4 * sizeof(void*))) return NULL;
+        len = *(long*)((char*)arr + 3 * sizeof(void*));
+        if (len < 1 || len > 16) return NULL;
+        mgr = *(void**)((char*)arr + 4 * sizeof(void*));
+        dlog("маршрут: менеджер найден запасным путём (FindObjectsOfType)");
+        return nc_obj_ok(mgr) ? mgr : NULL;
+    }
+}
 
 static int rt_find(void) {
-    void *kt, *img, *ko, *m, *tobj, *arr, *exc = NULL, *args[1], *fP, *fD; long len, i; char et[240];
+    void *kt, *mgr, *dict, *dk, *fe, *fc, *fP, *fD, *ent; long cnt, i; int offE, offC, stride, total = 0;
     g_rt_nj = 0;
-    if (!g_img || !rt_api()) { dlog("маршрут: нет il2cpp_class_get_type / il2cpp_type_get_object"); return 0; }
+    if (!g_img) { dlog("маршрут: нет образа игры"); return 0; }
     kt = A.class_from_name(g_img, "Hassle.Utilities.Input.VirtualControls", "VirtualJoystick");
     if (!kt) { dlog("маршрут: класс VirtualJoystick не найден"); return 0; }
     fP = find_field(kt, "m_Pressed"); fD = find_field(kt, "m_Delta");
     if (!fP || !fD) { dlog("маршрут: у VirtualJoystick нет полей m_Pressed / m_Delta"); return 0; }
     g_rt_offP = A.field_get_offset(fP); g_rt_offD = A.field_get_offset(fD);
     if (g_rt_offP < 0x10 || g_rt_offP > 0x100 || g_rt_offD < 0x10 || g_rt_offD > 0x100) { dlog_i("маршрут: странное смещение полей джойстика ", g_rt_offP); return 0; }
-    img = find_image_pre("UnityEngine.CoreModule");
-    ko = img ? A.class_from_name(img, "UnityEngine", "Object") : NULL;
-    m = ko ? A.class_get_method_from_name(ko, "FindObjectsOfType", 1) : NULL;
-    if (!m) { dlog("маршрут: нет UnityEngine.Object.FindObjectsOfType(Type)"); return 0; }
-    tobj = RA.type_get_object(RA.class_get_type(kt));
-    if (!tobj) { dlog("маршрут: не получен Type для VirtualJoystick"); return 0; }
-    args[0] = tobj;
-    arr = A.runtime_invoke(m, NULL, args, &exc);
-    if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: FindObjectsOfType бросил: ", et); return 0; }
-    if (!arr || !nc_readable(arr, 4 * sizeof(void*))) { dlog("маршрут: FindObjectsOfType вернул пусто"); return 0; }
-    len = *(long*)((char*)arr + 3 * sizeof(void*));
-    if (len < 0 || len > 64) { dlog_i("маршрут: странная длина массива ", len); return 0; }
-    for (i = 0; i < len && g_rt_nj < RT_MAXJ; i++) {
-        void* o = *(void**)((char*)arr + 4 * sizeof(void*) + (uptr)i * sizeof(void*));
-        if (!nc_obj_ok(o) || !nc_readable(o, g_rt_offD + 12)) continue;
-        g_rt_j[g_rt_nj] = o; g_rt_jk[g_rt_nj] = *(void**)o;
-        rt_name(o, "m_HorizontalInputName", g_rt_jh[g_rt_nj], 64);
-        rt_name(o, "m_VerticalInputName", g_rt_jv[g_rt_nj], 64);
+
+    mgr = rt_manager();
+    if (!mgr) { dlog("маршрут: VirtualControlsManager не найден (UI ещё не создан?)"); return 0; }
+    dict = ref_field_s(mgr, "m_NameVirtualControlsMap");
+    if (!dict || !nc_obj_ok(dict)) { dlog("маршрут: у менеджера нет словаря m_NameVirtualControlsMap"); return 0; }
+    dk = A.object_get_class(dict);
+    fe = find_field(dk, "_entries"); fc = find_field(dk, "_count");
+    if (!fe || !fc) { dlog("маршрут: у словаря нет полей _entries/_count"); return 0; }
+    offE = A.field_get_offset(fe); offC = A.field_get_offset(fc);
+    if (offE < 0x10 || offE > 0x100 || offC < 0x10 || offC > 0x100 || !nc_readable((char*)dict + offE, sizeof(void*)) || !nc_readable((char*)dict + offC, 4)) { dlog("маршрут: странные смещения словаря"); return 0; }
+    ent = *(void**)((char*)dict + offE); cnt = *(int*)((char*)dict + offC);
+    if (!ent || cnt < 0 || cnt > 256) { dlog_i("маршрут: словарь управления пуст/странный, count=", cnt); return 0; }
+    stride = 8 + 2 * (int)sizeof(void*);                           /* Entry<string, ref>: int hashCode; int next; key; value */
+    if (cnt == 0 || !nc_range_ok(ent, 4 * (long)sizeof(void*) + cnt * stride)) { dlog_i("маршрут: словарь управления: нечего читать, count=", cnt); return 0; }
+    for (i = 0; i < cnt; i++) {
+        char* e = (char*)ent + 4 * sizeof(void*) + (uptr)i * (uptr)stride;
+        void* key = *(void**)(e + 8);
+        void* val = *(void**)(e + 8 + sizeof(void*));
+        const char* cn;
+        if (!val || !nc_obj_ok(val)) continue;                     /* пустая/освобождённая запись */
+        total++;
+        cn = A.class_get_name(A.object_get_class(val));
+        if (!cn || !seq(cn, "VirtualJoystick")) continue;
+        if (g_rt_nj >= RT_MAXJ || !nc_readable(val, g_rt_offD + 12)) continue;
+        g_rt_j[g_rt_nj] = val; g_rt_jk[g_rt_nj] = *(void**)val;
+        rt_name(val, "m_HorizontalInputName", g_rt_jh[g_rt_nj], 64);
+        rt_name(val, "m_VerticalInputName", g_rt_jv[g_rt_nj], 64);
+        rt_str(key, g_rt_jkey[g_rt_nj], 64);
         g_rt_nj++;
     }
+    dlog_i("маршрут: в словаре управления элементов ", total);
     dlog_i("маршрут: найдено джойстиков ", g_rt_nj);
     return g_rt_nj;
 }
@@ -491,7 +541,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         b_s(&b, "Джойстиков: "); b_int(&b, nj);
         for (i = 0; i < nj; i++) {
             unsigned p = 0; float x = 0, y = 0; rt_read(i, &p, &x, &y);
-            b_s(&b, " | #"); b_int(&b, i); b_ch(&b, ' '); b_s(&b, g_rt_jh[i][0] ? g_rt_jh[i] : "-"); b_ch(&b, '/'); b_s(&b, g_rt_jv[i][0] ? g_rt_jv[i] : "-");
+            b_s(&b, " | #"); b_int(&b, i); b_ch(&b, ' '); b_s(&b, g_rt_jkey[i][0] ? g_rt_jkey[i] : "-"); b_ch(&b, ' '); b_s(&b, g_rt_jh[i][0] ? g_rt_jh[i] : "-"); b_ch(&b, '/'); b_s(&b, g_rt_jv[i][0] ? g_rt_jv[i] : "-");
             b_s(&b, " нажат "); b_int(&b, p); b_s(&b, " ("); b_fix(&b, x, 2); b_s(&b, "; "); b_fix(&b, y, 2); b_ch(&b, ')');
         }
         b_s(&b, " | смещения m_Pressed/m_Delta: "); b_int(&b, g_rt_offP); b_ch(&b, '/'); b_int(&b, g_rt_offD);
@@ -520,7 +570,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
     }
     if (w & 1) {                                                     /* rec */
         if (g_rt_mode) { b_s(&b, "Маршрут: сначала /route stop"); chat_say(msg); return; }
-        if (rt_find() < 1) { b_s(&b, "Маршрут: джойстик на экране не найден (см. near.log). Попробуйте /route probe"); chat_say(msg); return; }
+        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным джойстиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         g_rt_camRec = rt_cam_find(); g_rt_lc = g_rt_lv = 0;
         g_rt_n = 0; g_rt_sel = -1; g_rt_hasS = rt_my_pos(me); g_rt_hasE = 0;
         if (g_rt_hasS) { g_rt_S[0] = me[0]; g_rt_S[1] = me[1]; g_rt_S[2] = me[2]; }
@@ -533,7 +583,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
     if (w & 4) {                                                     /* play */
         if (g_rt_mode) { b_s(&b, "Маршрут: сначала /route stop"); chat_say(msg); return; }
         if (g_rt_n < 2 && rt_load() < 2) { b_s(&b, "Маршрут: записи нет. Сначала /route rec"); chat_say(msg); return; }
-        if (rt_find() < 1) { b_s(&b, "Маршрут: джойстик на экране не найден. Попробуйте /route probe"); chat_say(msg); return; }
+        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным джойстиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         rt_pick_joystick();
         if (g_rt_sel < 0) { b_s(&b, "Маршрут: джойстик из записи не найден среди экранных (/route probe)"); chat_say(msg); return; }
         if (g_rt_hasS && !(w & 64) && rt_my_pos(me)) {
