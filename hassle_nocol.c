@@ -271,6 +271,11 @@ static uptr nc_sig(void) {
 }
 
 /* ───────────── применить (ТОЛЬКО главный поток) ───────────── */
+/* тихий режим: периодический пересчёт (раз в несколько секунд) не должен засорять near.log построчным журналом */
+static volatile int g_nc_quiet, g_nc_periodic;
+static void ncq(const char* a) { if (!g_nc_quiet) dlog(a); }
+static void ncq2(const char* a, const char* b) { if (!g_nc_quiet) dlog2(a, b); }
+static void ncq_i(const char* a, long v) { if (!g_nc_quiet) dlog_i(a, v); }
 static void nc_apply(int ignore, NcRes* r) {
     void *pool, *stream, *apool, *items, *lmv, *lcap, *lign;
     int t, n0; u8 ign = ignore ? 1 : 0; uptr sig0;
@@ -295,24 +300,24 @@ static void nc_apply(int ignore, NcRes* r) {
         }
         return;
     }
-    dlog2("нативная /nocol: шаг 1: движение игрока найдено: ", A.class_get_name(A.object_get_class(lmv)));
+    ncq2("нативная /nocol: шаг 1: движение игрока найдено: ", A.class_get_name(A.object_get_class(lmv)));
     lcap = nc_capsule(lmv);
-    dlog2("нативная /nocol: шаг 2: капсула игрока: ", lcap ? "найдена" : "НЕ найдена");
+    ncq2("нативная /nocol: шаг 2: капсула игрока: ", lcap ? "найдена" : "НЕ найдена");
     lign = nc_ign_method(lmv);
     if (!g_nc_physTried) {
         void* img = find_image_pre("UnityEngine.PhysicsModule");
         void* kp = img ? A.class_from_name(img, "UnityEngine", "Physics") : NULL;
         g_nc_physTried = 1;
         if (kp) g_mPhysIgnore = A.class_get_method_from_name(kp, "IgnoreCollision", 3);
-        dlog2("нативная /nocol: Physics.IgnoreCollision ", g_mPhysIgnore ? "найден" : "НЕ найден (работаю только через IgnoreCollision движения)");
+        ncq2("нативная /nocol: Physics.IgnoreCollision ", g_mPhysIgnore ? "найден" : "НЕ найден (работаю только через IgnoreCollision движения)");
     }
     if (!g_nc_logged) {
         g_nc_logged = 1;
-        dlog2("нативная /nocol: IgnoreCollision(Collider,bool) у вашего движения: ", lign ? "найден" : "НЕ найден");
+        ncq2("нативная /nocol: IgnoreCollision(Collider,bool) у вашего движения: ", lign ? "найден" : "НЕ найден");
     }
-    dlog("нативная /nocol: шаг 2б: считаю подпись целей");
-    g_nc_verb = 1; sig0 = nc_sig(); g_nc_verb = 0;      /* ДО обхода: кто придёт во время обхода — вызовет повтор */
-    dlog("нативная /nocol: шаг 2в: подпись посчитана");
+    ncq("нативная /nocol: шаг 2б: считаю подпись целей");
+    g_nc_verb = !g_nc_quiet; sig0 = nc_sig(); g_nc_verb = 0;      /* ДО обхода: кто придёт во время обхода — вызовет повтор */
+    ncq("нативная /nocol: шаг 2в: подпись посчитана");
 
     g_nc_nt = 0;
     stream = ref_field_s(pool, "PlayersInStream");
@@ -321,32 +326,32 @@ static void nc_apply(int ignore, NcRes* r) {
     apool = nc_actor_pool();
     if (apool) { items = ref_field_s(apool, "m_Items"); if (items) nc_walk(items, nc_collect_cb, NULL); }
     r->actors = g_nc_nt - n0;
-    dlog_i("нативная /nocol: шаг 3: собрано целей (игроки) ", r->players);
-    dlog_i("нативная /nocol: шаг 3: собрано целей (NPC) ", r->actors);
+    ncq_i("нативная /nocol: шаг 3: собрано целей (игроки) ", r->players);
+    ncq_i("нативная /nocol: шаг 3: собрано целей (NPC) ", r->actors);
 
     for (t = 0; t < g_nc_nt; t++) {
         void* tm; void* c; void* tign; int v = t < 40;
-        if (v) dlog_i("нативная /nocol: цель ", t);
-        if (!nc_obj_ok(g_nc_t[t])) { if (v) dlog("нативная /nocol:    объект недоступен, пропуск"); continue; }
-        if (v) dlog2("нативная /nocol:    класс: ", A.class_get_name(A.object_get_class(g_nc_t[t])));
+        if (v) ncq_i("нативная /nocol: цель ", t);
+        if (!nc_obj_ok(g_nc_t[t])) { if (v) ncq("нативная /nocol:    объект недоступен, пропуск"); continue; }
+        if (v) ncq2("нативная /nocol:    класс: ", A.class_get_name(A.object_get_class(g_nc_t[t])));
         tm = nc_movement(g_nc_t[t]);
-        if (!tm) { if (v) dlog("нативная /nocol:    нет движения, пропуск"); continue; }
+        if (!tm) { if (v) ncq("нативная /nocol:    нет движения, пропуск"); continue; }
         c = nc_capsule(tm);
-        if (!c || c == lcap) { if (v) dlog("нативная /nocol:    нет капсулы (или это вы), пропуск"); continue; }
-        if (!nc_obj_ok(c)) { if (v) dlog("нативная /nocol:    капсула недоступна, пропуск"); r->skipped++; continue; }
-        if (v) dlog("нативная /nocol:    проверяю активность капсулы");
-        if (!nc_active(c)) { r->skipped++; if (v) dlog("нативная /nocol:    капсула неактивна, пропуск"); continue; }
+        if (!c || c == lcap) { if (v) ncq("нативная /nocol:    нет капсулы (или это вы), пропуск"); continue; }
+        if (!nc_obj_ok(c)) { if (v) ncq("нативная /nocol:    капсула недоступна, пропуск"); r->skipped++; continue; }
+        if (v) ncq("нативная /nocol:    проверяю активность капсулы");
+        if (!nc_active(c)) { r->skipped++; if (v) ncq("нативная /nocol:    капсула неактивна, пропуск"); continue; }
         r->cols++;
-        if (v) dlog("нативная /nocol:    IgnoreCollision у вашего движения");
+        if (v) ncq("нативная /nocol:    IgnoreCollision у вашего движения");
         if (lign) nc_call_ign(lign, lmv, c, ign, r);                 /* ваше движение игнорирует чужую капсулу */
-        if (v) dlog("нативная /nocol:    Physics.IgnoreCollision");
+        if (v) ncq("нативная /nocol:    Physics.IgnoreCollision");
         nc_call_phys(lcap, c, ign, r);                               /* и на уровне физики Unity */
         tign = nc_ign_method(tm);                                    /* обратно: движение цели игнорирует вашу капсулу (если она сама толкает вас) */
-        if (v) dlog("нативная /nocol:    IgnoreCollision у движения цели");
+        if (v) ncq("нативная /nocol:    IgnoreCollision у движения цели");
         if (tign && lcap) nc_call_ign(tign, tm, lcap, ign, r);
-        if (v) dlog("нативная /nocol:    готово");
+        if (v) ncq("нативная /nocol:    готово");
     }
-    dlog("нативная /nocol: цикл по целям завершён");
+    ncq("нативная /nocol: цикл по целям завершён");
     if (sig0) g_nc_sig = sig0;
     g_nc_applyT = NC_NOW(); g_nc_skipped = r->skipped;
     {
@@ -355,8 +360,8 @@ static void nc_apply(int ignore, NcRes* r) {
         b_s(&x, ", NPC "); b_int(&x, r->actors); b_s(&x, ", капсул "); b_int(&x, r->cols); b_s(&x, ", неактивных "); b_int(&x, r->skipped);
         b_s(&x, ", IgnoreCollision ок/ошибок "); b_int(&x, r->ign_ok); b_ch(&x, '/'); b_int(&x, r->ign_exc);
         b_s(&x, ", Physics ок/ошибок "); b_int(&x, r->phys_ok); b_ch(&x, '/'); b_int(&x, r->phys_exc);
-        dlog(t2);
-        if (r->exc[0]) dlog2("нативная /nocol: первое исключение: ", r->exc);
+        ncq(t2);
+        if (r->exc[0]) ncq2("нативная /nocol: первое исключение: ", r->exc);
     }
 }
 
@@ -400,15 +405,18 @@ static void nocol_bg_tick(void) {
     if (now - g_nc_postT < 1) return;
     sig = nc_sig();
     if (!sig) return;
+    g_nc_periodic = 0;
     if (sig != g_nc_sig) { g_nc_retry = 0; want = 1; }                              /* состав целей изменился */
-    else if (g_nc_skipped > 0 && g_nc_retry < 5 && now - g_nc_applyT >= 2) { g_nc_retry++; want = 1; }   /* были неактивные капсулы — повторим */
+    else if (now - g_nc_applyT >= (g_nc_skipped > 0 ? 2 : 3)) { want = 1; g_nc_periodic = 1; }
+    /* Раз в 2–3 с применяем заново даже если список целей тот же: Unity сбрасывает IgnoreCollision, когда коллайдер выключали/включали
+       (игрок сел в машину и вышел, NPC ушёл из пула и вернулся), а «подпись» по указателям этого не замечает. Повторное применение безвредно. */
     if (want) nc_post();
 }
 static void nc_auto_apply(void) {                   /* главный поток, из Post */
     NcRes r;
     g_nc_pending = 0;
     if (!g_nc_on || !g_nc_auto) return;
-    nc_apply(1, &r);
+    g_nc_quiet = g_nc_periodic; nc_apply(1, &r); g_nc_quiet = 0;
     if (r.err[0]) { g_nc_postT = NC_NOW() + 4; return; }                            /* ошибка — пауза ~5 с, чтобы не спамить */
     g_nc_lastP = r.players; g_nc_lastA = r.actors; g_nc_lastC = r.cols;
 }
@@ -493,14 +501,6 @@ static void nocol_register(void* dict, void* mset, void* kls, int size, int off_
     else dlog("нативная /nocol: НЕ зарегистрирована");
 }
 
-/* общий замок записи в реестр чат-команд: если рядом лежит ещё один модуль (hassle_pickup.c), они не пишут в словарь одновременно */
-#ifndef NEAR_REG_LOCK
-#define NEAR_REG_LOCK
-static volatile int g_near_regLock;
-static void near_reg_lock(void) { while (__sync_lock_test_and_set(&g_near_regLock, 1)) usleep(1000); }
-static void near_reg_unlock(void) { __sync_lock_release(&g_near_regLock); }
-#endif
-
 /* ───────────── самозапуск (hassle_near.c об этом ничего не знает) ───────────── */
 /* Ждёт, пока мод Near сам зарегистрирует /rec (значит, игра готова, а образец делегата чат-команды найден), берёт тот же реестр и
    образец и добавляет /nocol. Потом в том же потоке каждые 300 мс зовёт слежку за новыми игроками/NPC. */
@@ -522,7 +522,7 @@ static int nocol_boot_once(void) {
     off_ii = f_ii ? A.field_get_offset(f_ii) : 0;
     mset = find_method(A.object_get_class(dict), "set_Item", 2);
     if (!mset) { dlog("нативная /nocol: у реестра нет set_Item"); return 0; }
-    near_reg_lock(); nocol_register(dict, mset, kls, size, off_mp, off_ii); near_reg_unlock();
+    nocol_register(dict, mset, kls, size, off_mp, off_ii);
     return 1;
 }
 static void* nocol_main(void* arg) {
