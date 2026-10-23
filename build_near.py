@@ -2,6 +2,7 @@
 """
 build_near.py - builds with Android NDK:
   hassle_near.c  -> libHassleExtended_arm64.so / libHassleExtended_arm32.so   (мод «игроки рядом» + HTTP)
+  самый «верхний» из файлов: hassle_pickup.c -> hassle_nocol.c -> hassle_near.c
 
   python build_near.py [path_to_NDK]
 """
@@ -10,9 +11,13 @@ import glob, os, platform, subprocess, sys
 here = os.path.dirname(os.path.abspath(__file__))
 src = os.path.join(here, 'hassle_near.c')
 nocol = os.path.join(here, 'hassle_nocol.c')      # необязательный модуль /nocol: он сам включает hassle_near.c; нет файла — собираем как раньше
+pickup = os.path.join(here, 'hassle_pickup.c')    # необязательный модуль /pk: он сам включает hassle_nocol.c (если есть) или hassle_near.c
 if os.path.exists(nocol):
     src = nocol
     print('модуль /nocol: найден hassle_nocol.c')
+if os.path.exists(pickup):
+    src = pickup
+    print('модуль /pk: найден hassle_pickup.c')
 
 def find_ndk():
     if len(sys.argv) > 1: return sys.argv[1]

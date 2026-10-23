@@ -493,6 +493,14 @@ static void nocol_register(void* dict, void* mset, void* kls, int size, int off_
     else dlog("нативная /nocol: НЕ зарегистрирована");
 }
 
+/* общий замок записи в реестр чат-команд: если рядом лежит ещё один модуль (hassle_pickup.c), они не пишут в словарь одновременно */
+#ifndef NEAR_REG_LOCK
+#define NEAR_REG_LOCK
+static volatile int g_near_regLock;
+static void near_reg_lock(void) { while (__sync_lock_test_and_set(&g_near_regLock, 1)) usleep(1000); }
+static void near_reg_unlock(void) { __sync_lock_release(&g_near_regLock); }
+#endif
+
 /* ───────────── самозапуск (hassle_near.c об этом ничего не знает) ───────────── */
 /* Ждёт, пока мод Near сам зарегистрирует /rec (значит, игра готова, а образец делегата чат-команды найден), берёт тот же реестр и
    образец и добавляет /nocol. Потом в том же потоке каждые 300 мс зовёт слежку за новыми игроками/NPC. */
@@ -514,7 +522,7 @@ static int nocol_boot_once(void) {
     off_ii = f_ii ? A.field_get_offset(f_ii) : 0;
     mset = find_method(A.object_get_class(dict), "set_Item", 2);
     if (!mset) { dlog("нативная /nocol: у реестра нет set_Item"); return 0; }
-    nocol_register(dict, mset, kls, size, off_mp, off_ii);
+    near_reg_lock(); nocol_register(dict, mset, kls, size, off_mp, off_ii); near_reg_unlock();
     return 1;
 }
 static void* nocol_main(void* arg) {
