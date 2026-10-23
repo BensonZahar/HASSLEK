@@ -1,40 +1,37 @@
 /*
- * hassle_route.c — необязательный модуль «/route»: записать свой маршрут пешком и повторить его ТОЧНО ТАК ЖЕ.
+ * hassle_route.c — необязательный модуль «/route»: записать свой маршрут пешком и повторить его так же.
  *
  * hassle_near.c и hassle_nocol.c НЕ МЕНЯЮТСЯ. Этот файл включает hassle_nocol.c (а тот — hassle_near.c), сам запускает свой поток
  * и сам регистрирует команду. build_near.py собирает hassle_route.c, если он лежит рядом.
  * КАК УБРАТЬ: удалите hassle_route.c и пересоберите .so — всё как раньше.
  *
  * Команда в чате (нативная, как /rec и /nocol):
- *   /route rec            начать запись; запись стартует, когда вы возьмётесь за левый джойстик
+ *   /route rec            начать запись; запись стартует, когда вы возьмётесь за левый стик
  *   /route stop           остановить запись (или остановить повтор); запись сохраняется в HLOG/route.txt
  *   /route play           повторить записанный маршрут (без записи в памяти — берёт HLOG/route.txt)
  *   /route play force     то же, но без проверки «вы стоите там же, где начинали запись»
  *   /route play nocam     повтор без выставления камеры (камеру держите сами)
  *   /route status         состояние
- *   /route probe          найти джойстики на экране и показать их значения (диагностика)
+ *   /route probe          найти экранный стик и показать его значение (диагностика)
  *
- * Как это работает (проверено по дампу игры, VirtualAxis.GetAxis):
- *   • Левый стик — Hassle.Utilities.Input.VirtualControls.VirtualJoystick (наследник VirtualAxis). Игра читает его так:
- *     m_Pressed (bool, +0x28) == 0 → ось 0; иначе m_Delta.x (+0x2C) для горизонтальной оси и m_Delta.y (+0x30) для вертикальной.
- *     Нажатие пальцем пишет в эти же поля (OnTouchStart/OnTouchMove/OnTouchEnd).
- *   • Запись: фоновый поток каждые ~5 мс читает m_Pressed и m_Delta выбранного джойстика и сохраняет значение с временем, когда оно изменилось.
- *   • Повтор: тот же поток каждые ~5 мс записывает в m_Pressed/m_Delta значение, которое было в этот момент записи. Игра видит обычный ввод.
- *   • Никаких вызовов IL2CPP из фонового потока: только чтение/запись полей по смещениям. Поиск джойстиков (FindObjectsOfType) —
- *     только в главном потоке, в обработчике чат-команды. Сообщения в чат по окончании идут через UnitySynchronizationContext.Post
- *     (механизм из /nocol).
+ * Как это устроено (по дампу игры и по Hud.js):
+ *   • Экранный стик рисует Vue-компонент в HUD. Он НЕ связан с VirtualControlsManager (тот, что нашёл прошлый вариант мода: ключи
+ *     Horizontal/Vertical/Joystick, m_Pressed всегда 0). Компонент зовёт window.onScreenControlTouchStart/Move/End("<Gamepad>/leftStick", x, y),
+ *     это Hassle.WebView.Controls.OnScreenControls → OnWebViewScreenStick (OnScreenControl из Unity Input System), который пишет
+ *     значение в виртуальный <Gamepad>/leftStick. Игра читает движение уже оттуда.
+ *   • Объект стика лежит в статическом словаре OnScreenControls.m_Controls (ключ "<Gamepad>/leftStick") и существует, пока HUD на экране
+ *     (плавающий круг рисуется только при касании, а сам стик есть всегда).
+ *   • Запись: КАЖДЫЙ КАДР (в главном потоке) читаем значение стика InputControl<Vector2>.ReadUnprocessedValue() и пишем, когда оно изменилось.
+ *   • Повтор: каждый кадр зовём OnWebViewScreenStick.OnTouchStart/OnTouchMove(Vector2)/OnTouchEnd — ровно то, что делает палец через JS.
+ *   • Все вызовы IL2CPP идут ТОЛЬКО из главного потока. Фоновый поток лишь раз в ~12 мс ставит в очередь SynchronizationContext.Post
+ *     «тик» (механизм из /nocol), а время считает по монотонным часам, так что пропущенные кадры ничего не ломают.
  *   • Камера: Game.MainCamera.m_Aim (CinemachinePOV) → m_HorizontalAxis.Value (поворот, градусы) и m_VerticalAxis.Value (наклон).
- *     Запись пишет их вместе со стиком; повтор сначала выставляет камеру (пауза ~0,25 с), потом идёт, повторяя и повороты камеры. Так
- *     движение (оно считается относительно камеры) идёт в ту же сторону, как при записи, откуда бы вы ни смотрели перед /route play.
- *     Если камера не найдена, запись идёт только по стику (сообщит в чат), а при повторе камеру нужно выставить самому.
- *   • Если во время повтора вы возьмётесь за джойстик сами, повтор прерывается (мод замечает, что значение отличается от записанного).
+ *     Пишется вместе со стиком; при повторе камера выставляется сначала (пауза ~0,25 с), потом повторяются и её повороты.
+ *   • Если во время повтора вы возьмётесь за стик сами, повтор прерывается (значение стика не совпадает с тем, что писал мод).
  *
- * Ограничения первой версии (важно):
- *   • Повторяются левый стик и камера. Прыжок и спринт (кнопки) НЕ записываются. Положение игрока перед /route play проверяется по
- *     точке начала записи (не дальше 2 м).
- *   • Во время повтора камера занята модом: крутить её пальцем бесполезно (/route play nocam — чтобы камеру держали вы).
- *   • Точность: ввод повторяется с точностью до миллисекунд, но игра идёт по кадрам, так что на длинном маршруте возможен небольшой снос.
- *     По окончании мод пишет в чат, на сколько метров вы не дошли до точки конца записи.
+ * Ограничения: повторяются стик и камера. Прыжок и спринт (кнопки) НЕ записываются. Положение игрока перед /route play проверяется
+ * по точке начала записи (не дальше 2 м). Во время повтора камера занята модом (/route play nocam — чтобы камеру держали вы).
+ * Точность: игра идёт по кадрам, на длинном маршруте возможен небольшой снос; по окончании мод пишет, на сколько метров вы не дошли до конца записи.
  */
 #include "hassle_nocol.c"
 
@@ -61,27 +58,27 @@ static int rt_api(void) {
 }
 
 /* ───────────── данные ───────────── */
-typedef struct { unsigned t; float x, y; unsigned p; float c, v; } RtS;   /* t — мс от начала, p — m_Pressed, x/y — m_Delta, c/v — поворот/наклон камеры */
+typedef struct { unsigned t; float x, y; unsigned p; float c, v; } RtS;   /* t — мс от начала, p — стик задет (x или y не 0), x/y — значение стика, c/v — поворот/наклон камеры */
 static RtS g_rt_s[RT_MAX];
 static volatile int g_rt_n;
 static volatile int g_rt_mode;       /* 0 — ничего, 1 — запись, 2 — повтор */
-static volatile int g_rt_evt;        /* для сообщения в чат из главного потока: 1 повтор закончен, 2 вы взялись за джойстик, 3 запись переполнена, 4 джойстик пропал, 5 лимит времени */
-static char g_rt_hn[64], g_rt_vn[64];
+static volatile int g_rt_tickPending;
+static volatile long long g_rt_tickT;
 static int g_rt_idx = -1;
+static char g_rt_hn[64], g_rt_vn[64];                              /* в файле остались для совместимости формата */
 static int g_rt_hasS, g_rt_hasE;
 static float g_rt_S[3], g_rt_E[3];
 
-static void* g_rt_j[RT_MAXJ];
-static void* g_rt_jk[RT_MAXJ];                                   /* заголовок объекта (указатель на класс) на момент поиска — для проверки перед записью */
-static char g_rt_jh[RT_MAXJ][64], g_rt_jv[RT_MAXJ][64];
-static int g_rt_nj;
-static int g_rt_offP = 0x28, g_rt_offD = 0x2C;
-static int g_rt_sel = -1;
+#define RT_STICK "<Gamepad>/leftStick"
+static void* g_rt_st;  static void* g_rt_stk;                      /* OnWebViewScreenStick и его заголовок (проверка перед вызовом) */
+static void* g_rt_ctrl; static void* g_rt_ctrlk;                   /* InputControl этого стика (читаем значение) */
+static void *g_rt_mRead, *g_rt_mTS, *g_rt_mTM, *g_rt_mTE;          /* ReadUnprocessedValue/ReadValue, OnTouchStart, OnTouchMove(Vector2), OnTouchEnd */
+static char g_rt_key[64];
+static int g_rt_started;                                           /* в записи: за стик уже взялись */
 static long long g_rt_t0;
 static int g_rt_pi;
-static int g_rt_wrote, g_rt_bad;
-static unsigned g_rt_wp;
-static float g_rt_wx, g_rt_wy;
+static int g_rt_wrote, g_rt_bad, g_rt_down, g_rt_whi;
+static float g_rt_wh[4][2];                                        /* последние записанные значения (стик обновляется с задержкой в кадр) */
 static float g_rt_lx, g_rt_ly;
 static unsigned g_rt_lp;
 static char g_rt_fbuf[RT_FBUF];
@@ -98,13 +95,7 @@ static long long rt_now(void) {
     return (long long)t.sec * 1000 + t.nsec / 1000000;
 }
 
-/* ───────────── поиск джойстиков (ТОЛЬКО главный поток) ─────────────
-   ВАЖНО: VirtualJoystick — НЕ UnityEngine.Object (VirtualControl — обычный абстрактный класс без базы), поэтому
-   FindObjectsOfType(VirtualJoystick) не находит его НИКОГДА — отсюда «Джойстиков: 0», нажат палец или нет.
-   Нарисованный на экране «плавающий» стик (Hud.js: show=false, opacity 0 до касания) на это не влияет: C#-объект создаётся
-   сразу, когда HUD смонтирован (Hud.js mounted(): window.onScreenJoystickCreate("<Gamepad>/leftStick")), и живёт, пока HUD на экране.
-   Настоящий путь к нему:
-     UI.VirtualControls (static)  →  VirtualControlsManager.m_NameVirtualControlsMap (Dictionary<string, VirtualControl>)  →  значения класса VirtualJoystick. */
+/* ───────────── поиск экранного стика (ТОЛЬКО главный поток) ───────────── */
 static void rt_str(void* s, char* out, int cap) {
     int n, i; const u16* ch;
     out[0] = 0;
@@ -114,83 +105,88 @@ static void rt_str(void* s, char* out, int cap) {
     utf16_to_utf8(ch, n, out, cap);
     for (i = 0; out[i]; i++) if (out[i] == ' ') out[i] = '_';
 }
-static void rt_name(void* o, const char* field, char* out, int cap) { rt_str(ref_field_s(o, field), out, cap); }
 
-static char g_rt_jkey[RT_MAXJ][64];                                /* ключ словаря, под которым джойстик зарегистрирован (для /route probe) */
+static int rt_stick_ok(void) { return g_rt_st && nc_obj_ok(g_rt_st) && *(void**)g_rt_st == g_rt_stk; }
+static int rt_ctrl_ok(void) { return g_rt_ctrl && nc_obj_ok(g_rt_ctrl) && *(void**)g_rt_ctrl == g_rt_ctrlk; }
 
-static void* rt_manager(void) {                                    /* VirtualControlsManager */
-    void *kui, *m, *mgr = NULL, *exc = NULL; char et[240];
-    kui = A.class_from_name(g_img, "Hassle.Graphics.UserInterfaces", "UI");
-    m = kui ? find_method(kui, "get_VirtualControls", 0) : NULL;
-    if (m) {
-        mgr = A.runtime_invoke(m, NULL, NULL, &exc);
-        if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: UI.VirtualControls бросил: ", et); mgr = NULL; }
-    } else dlog("маршрут: нет UI.get_VirtualControls");
-    if (mgr && nc_obj_ok(mgr)) return mgr;
-    {   /* запасной путь: сам менеджер — MonoBehaviour, его FindObjectsOfType находит */
-        void *kt, *img, *ko, *fm, *tobj, *arr, *args[1]; long len;
-        exc = NULL;
-        kt = A.class_from_name(g_img, "Hassle.Utilities.Input.VirtualControls", "VirtualControlsManager");
-        img = find_image_pre("UnityEngine.CoreModule");
-        ko = img ? A.class_from_name(img, "UnityEngine", "Object") : NULL;
-        fm = ko ? A.class_get_method_from_name(ko, "FindObjectsOfType", 1) : NULL;
-        if (!kt || !fm || !rt_api()) return NULL;
-        tobj = RA.type_get_object(RA.class_get_type(kt));
-        if (!tobj) return NULL;
-        args[0] = tobj;
-        arr = A.runtime_invoke(fm, NULL, args, &exc);
-        if (exc || !arr || !nc_readable(arr, 4 * sizeof(void*))) return NULL;
-        len = *(long*)((char*)arr + 3 * sizeof(void*));
-        if (len < 1 || len > 16) return NULL;
-        mgr = *(void**)((char*)arr + 4 * sizeof(void*));
-        dlog("маршрут: менеджер найден запасным путём (FindObjectsOfType)");
-        return nc_obj_ok(mgr) ? mgr : NULL;
-    }
+/* значение стика (главный поток). Результат — упакованный Vector2: два float сразу после заголовка объекта */
+static int rt_stick_read(float* x, float* y) {
+    void *r, *exc = NULL; const float* f;
+    if (!g_rt_mRead || !rt_ctrl_ok()) return 0;
+    r = A.runtime_invoke(g_rt_mRead, g_rt_ctrl, NULL, &exc);
+    if (exc || !r || !nc_readable((char*)r + HDR, 8)) return 0;
+    f = (const float*)((char*)r + HDR);
+    *x = f[0]; *y = f[1];
+    return 1;
+}
+/* what: 1 — OnTouchStart, 2 — OnTouchMove(x, y), 3 — OnTouchEnd */
+static int rt_stick_send(int what, float x, float y) {
+    void *a[1], *exc = NULL; float v[2]; void* m = what == 1 ? g_rt_mTS : what == 2 ? g_rt_mTM : g_rt_mTE;
+    if (!m || !rt_stick_ok()) return 0;
+    v[0] = x; v[1] = y; a[0] = v;                                /* Vector2 передаётся указателем на два float */
+    A.runtime_invoke(m, g_rt_st, what == 2 ? a : NULL, &exc);
+    return exc ? 0 : 1;
 }
 
 static int rt_find(void) {
-    void *kt, *mgr, *dict, *dk, *fe, *fc, *fP, *fD, *ent; long cnt, i; int offE, offC, stride, total = 0;
-    g_rt_nj = 0;
+    void *kc, *fd, *dict = NULL, *dk, *fe, *fc, *ent, *best = NULL; long cnt, i; int offE, offC, stride;
+    char bestKey[64]; const char* bestCls = NULL;
+    g_rt_st = g_rt_ctrl = g_rt_mRead = g_rt_mTS = g_rt_mTM = g_rt_mTE = NULL; g_rt_key[0] = 0; bestKey[0] = 0;
     if (!g_img) { dlog("маршрут: нет образа игры"); return 0; }
-    kt = A.class_from_name(g_img, "Hassle.Utilities.Input.VirtualControls", "VirtualJoystick");
-    if (!kt) { dlog("маршрут: класс VirtualJoystick не найден"); return 0; }
-    fP = find_field(kt, "m_Pressed"); fD = find_field(kt, "m_Delta");
-    if (!fP || !fD) { dlog("маршрут: у VirtualJoystick нет полей m_Pressed / m_Delta"); return 0; }
-    g_rt_offP = A.field_get_offset(fP); g_rt_offD = A.field_get_offset(fD);
-    if (g_rt_offP < 0x10 || g_rt_offP > 0x100 || g_rt_offD < 0x10 || g_rt_offD > 0x100) { dlog_i("маршрут: странное смещение полей джойстика ", g_rt_offP); return 0; }
-
-    mgr = rt_manager();
-    if (!mgr) { dlog("маршрут: VirtualControlsManager не найден (UI ещё не создан?)"); return 0; }
-    dict = ref_field_s(mgr, "m_NameVirtualControlsMap");
-    if (!dict || !nc_obj_ok(dict)) { dlog("маршрут: у менеджера нет словаря m_NameVirtualControlsMap"); return 0; }
+    kc = A.class_from_name(g_img, "Hassle.WebView.Controls", "OnScreenControls");
+    if (!kc) { dlog("маршрут: класс OnScreenControls не найден"); return 0; }
+    fd = A.class_get_field_from_name(kc, "m_Controls");
+    if (!fd) { dlog("маршрут: у OnScreenControls нет поля m_Controls"); return 0; }
+    A.field_static_get_value(fd, &dict);
+    if (!dict || !nc_obj_ok(dict)) { dlog("маршрут: OnScreenControls.m_Controls = null (HUD с экранным управлением не создан?)"); return 0; }
     dk = A.object_get_class(dict);
     fe = find_field(dk, "_entries"); fc = find_field(dk, "_count");
     if (!fe || !fc) { dlog("маршрут: у словаря нет полей _entries/_count"); return 0; }
     offE = A.field_get_offset(fe); offC = A.field_get_offset(fc);
     if (offE < 0x10 || offE > 0x100 || offC < 0x10 || offC > 0x100 || !nc_readable((char*)dict + offE, sizeof(void*)) || !nc_readable((char*)dict + offC, 4)) { dlog("маршрут: странные смещения словаря"); return 0; }
     ent = *(void**)((char*)dict + offE); cnt = *(int*)((char*)dict + offC);
-    if (!ent || cnt < 0 || cnt > 256) { dlog_i("маршрут: словарь управления пуст/странный, count=", cnt); return 0; }
     stride = 8 + 2 * (int)sizeof(void*);                           /* Entry<string, ref>: int hashCode; int next; key; value */
-    if (cnt == 0 || !nc_range_ok(ent, 4 * (long)sizeof(void*) + cnt * stride)) { dlog_i("маршрут: словарь управления: нечего читать, count=", cnt); return 0; }
+    if (!ent || cnt < 0 || cnt > 256) { dlog_i("маршрут: словарь экранных элементов странный, count=", cnt); return 0; }
+    if (cnt == 0 || !nc_range_ok(ent, 4 * (long)sizeof(void*) + cnt * stride)) { dlog("маршрут: экранных элементов нет (HUD ещё не создал стик)"); return 0; }
     for (i = 0; i < cnt; i++) {
         char* e = (char*)ent + 4 * sizeof(void*) + (uptr)i * (uptr)stride;
         void* key = *(void**)(e + 8);
         void* val = *(void**)(e + 8 + sizeof(void*));
-        const char* cn;
-        if (!val || !nc_obj_ok(val)) continue;                     /* пустая/освобождённая запись */
-        total++;
+        char k[64]; const char* cn;
+        if (!val || !nc_obj_ok(val)) continue;
+        rt_str(key, k, sizeof k);
         cn = A.class_get_name(A.object_get_class(val));
-        if (!cn || !seq(cn, "VirtualJoystick")) continue;
-        if (g_rt_nj >= RT_MAXJ || !nc_readable(val, g_rt_offD + 12)) continue;
-        g_rt_j[g_rt_nj] = val; g_rt_jk[g_rt_nj] = *(void**)val;
-        rt_name(val, "m_HorizontalInputName", g_rt_jh[g_rt_nj], 64);
-        rt_name(val, "m_VerticalInputName", g_rt_jv[g_rt_nj], 64);
-        rt_str(key, g_rt_jkey[g_rt_nj], 64);
-        g_rt_nj++;
+        dlog2("маршрут: экранный элемент: ", k);
+        dlog2("маршрут:    класс: ", cn ? cn : "?");
+        if (cn && seq(cn, "OnWebViewScreenStick") && (!best || seq(k, RT_STICK))) {
+            best = val; bestCls = cn;
+            { int q; for (q = 0; q < 63 && k[q]; q++) bestKey[q] = k[q]; bestKey[q] = 0; }
+        }
     }
-    dlog_i("маршрут: в словаре управления элементов ", total);
-    dlog_i("маршрут: найдено джойстиков ", g_rt_nj);
-    return g_rt_nj;
+    if (!best) { dlog("маршрут: среди экранных элементов нет OnWebViewScreenStick"); return 0; }
+    (void)bestCls;
+    {
+        void* kcls = A.object_get_class(best); void *ctrl, *m1, *m2; float tx, ty;
+        g_rt_mTS = find_method(kcls, "OnTouchStart", 0);
+        g_rt_mTM = find_method(kcls, "OnTouchMove", 1);
+        g_rt_mTE = find_method(kcls, "OnTouchEnd", 0);
+        if (!g_rt_mTS || !g_rt_mTM || !g_rt_mTE) { dlog("маршрут: у стика нет OnTouchStart/OnTouchMove/OnTouchEnd"); return 0; }
+        ctrl = ref_field_s(best, "m_Control");
+        if (!ctrl || !nc_obj_ok(ctrl)) {                           /* поле ещё пусто — спросим свойством control */
+            void *gm = find_method(kcls, "get_control", 0), *exc = NULL;
+            ctrl = gm ? A.runtime_invoke(gm, best, NULL, &exc) : NULL;
+            if (exc) ctrl = NULL;
+        }
+        if (!ctrl || !nc_obj_ok(ctrl)) { dlog("маршрут: у стика нет InputControl (виртуальный геймпад ещё не создан?)"); return 0; }
+        g_rt_st = best; g_rt_stk = *(void**)best; g_rt_ctrl = ctrl; g_rt_ctrlk = *(void**)ctrl;
+        m1 = find_method(A.object_get_class(ctrl), "ReadUnprocessedValue", 0);
+        m2 = find_method(A.object_get_class(ctrl), "ReadValue", 0);
+        g_rt_mRead = m1;
+        if (!m1 || !rt_stick_read(&tx, &ty)) { g_rt_mRead = m2; if (!m2 || !rt_stick_read(&tx, &ty)) { g_rt_mRead = NULL; g_rt_st = g_rt_ctrl = NULL; dlog("маршрут: значение стика не читается (ReadUnprocessedValue/ReadValue)"); return 0; } }
+        { int q; for (q = 0; q < 63 && bestKey[q]; q++) g_rt_key[q] = bestKey[q]; g_rt_key[q] = 0; }
+    }
+    dlog2("маршрут: стик найден, ключ ", g_rt_key);
+    return 1;
 }
 
 /* камера (ТОЛЬКО главный поток): Game.MainCamera (static) → m_Aim (CinemachinePOV) → AxisState.Value горизонтали и вертикали */
@@ -235,48 +231,23 @@ static int rt_cam_write(float c, float v) {
     return 1;
 }
 
-/* ───────────── чтение / запись полей джойстика (любой поток, без IL2CPP) ───────────── */
-static int rt_read(int i, unsigned* p, float* x, float* y) {
-    char* o;
-    if (i < 0 || i >= g_rt_nj) return 0;
-    o = (char*)g_rt_j[i];
-    if (!o || !nc_readable(o, g_rt_offD + 12) || *(void**)o != g_rt_jk[i]) return 0;
-    *p = *(volatile u8*)(o + g_rt_offP) ? 1u : 0u;
-    *x = *(volatile float*)(o + g_rt_offD);
-    *y = *(volatile float*)(o + g_rt_offD + 4);
-    return 1;
-}
-static int rt_write(int i, unsigned p, float x, float y) {
-    char* o;
-    if (i < 0 || i >= g_rt_nj) return 0;
-    o = (char*)g_rt_j[i];
-    if (!o || !nc_readable(o, g_rt_offD + 12) || *(void**)o != g_rt_jk[i]) return 0;    /* объект исчез/подменён — не пишем */
-    *(volatile float*)(o + g_rt_offD) = x;
-    *(volatile float*)(o + g_rt_offD + 4) = y;
-    *(volatile u8*)(o + g_rt_offP) = p ? 1 : 0;
-    return 1;
-}
-
-/* ───────────── сообщение в главный поток ───────────── */
+/* ───────────── тик: всё происходит в главном потоке ───────────── */
 static void native_route_cmd(void* self, void* args, void* mi);
-static void rt_post(void) {
+static void rt_report(int code);
+static void rt_event(int code) { dlog_i("маршрут: событие ", code); rt_report(code); }
+
+static void rt_post(void) {                                        /* фоновый поток: поставить тик в очередь главного потока */
     void *cb, *st, *a[2], *exc = NULL; char et[200];
-    if (!g_nc_ctx || !g_nc_postM || !g_nc_kCb) { dlog("маршрут: нет главного потока для сообщения в чат (итог смотрите в /route status)"); return; }
+    if (!g_nc_ctx || !g_nc_postM || !g_nc_kCb) { g_rt_tickPending = 0; return; }
     ensure_attached();
     cb = clone_cmd_delegate(g_nc_kCb, g_nc_dsize, g_nc_offmp, g_nc_offii, (uptr)native_route_cmd);
-    st = A.string_new("route-evt");
-    if (!cb || !st) { dlog("маршрут: не создался делегат для Post"); return; }
+    st = A.string_new("route-tick");
+    if (!cb || !st) { g_rt_tickPending = 0; dlog("маршрут: не создался делегат для Post"); return; }
     a[0] = cb; a[1] = st;
     A.runtime_invoke(g_nc_postM, g_nc_ctx, a, &exc);
-    if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: Post бросил: ", et); }
-}
-static void rt_event(int code) {
-    g_rt_evt = code;
-    dlog_i("маршрут: событие ", code);
-    rt_post();
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: Post бросил: ", et); g_rt_tickPending = 0; }
 }
 
-/* ───────────── рабочий поток ───────────── */
 static void rt_push(unsigned t, unsigned p, float x, float y, float c, float v) {
     int n = g_rt_n;
     if (n >= RT_MAX) return;
@@ -285,49 +256,59 @@ static void rt_push(unsigned t, unsigned p, float x, float y, float c, float v) 
 }
 static float rt_abs(float v) { return v < 0 ? -v : v; }
 
+static void rt_stop_rec(Buf* b);
+static void rt_release_stick(void) {                               /* отпустить стик, если мы его держали */
+    if (g_rt_down) { rt_stick_send(3, 0, 0); g_rt_down = 0; }
+}
+
 static void rt_rec_step(void) {
-    unsigned p; float x, y, c = 0, v = 0; long long now; int i;
+    float x, y, c = 0, v = 0; unsigned p; long long now;
     if (g_rt_camRec && !rt_cam_read(&c, &v)) { c = g_rt_lc; v = g_rt_lv; }
-    if (g_rt_sel < 0) {                                          /* ждём, когда вы возьмётесь за стик */
-        for (i = 0; i < g_rt_nj; i++) {
-            if (rt_read(i, &p, &x, &y) && p && (x != 0 || y != 0)) {
-                g_rt_sel = i; g_rt_t0 = rt_now();
-                g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v;
-                g_rt_n = 0;
-                rt_push(0, p, x, y, c, v);
-                dlog_i("маршрут: запись началась, джойстик ", i);
-                return;
-            }
+    if (!rt_stick_read(&x, &y)) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(4); return; }
+    p = (x != 0 || y != 0) ? 1u : 0u;
+    if (!g_rt_started) {                                           /* ждём, когда вы возьмётесь за стик */
+        if (p) {
+            g_rt_started = 1; g_rt_t0 = rt_now();
+            g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v;
+            g_rt_n = 0;
+            rt_push(0, p, x, y, c, v);
+            dlog("маршрут: запись началась");
         }
         return;
     }
-    if (!rt_read(g_rt_sel, &p, &x, &y)) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(4); return; }
     now = rt_now() - g_rt_t0;
     if (p != g_rt_lp || rt_abs(x - g_rt_lx) > 0.004f || rt_abs(y - g_rt_ly) > 0.004f || (g_rt_camRec && (rt_abs(c - g_rt_lc) > 0.15f || rt_abs(v - g_rt_lv) > 0.15f))) {
         rt_push((unsigned)now, p, x, y, c, v);
         g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v;
     }
-    if (g_rt_n >= RT_MAX - 2) { rt_push((unsigned)now, 0, 0, 0, g_rt_lc, g_rt_lv); __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(3); return; }
-    if (now > RT_MAXMS) { rt_push((unsigned)now, 0, 0, 0, g_rt_lc, g_rt_lv); __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(5); return; }
+    if (g_rt_n >= RT_MAX - 2) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(3); return; }
+    if (now > RT_MAXMS) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(5); return; }
+}
+
+static void rt_play_stop(int code) {
+    __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE);
+    rt_release_stick();
+    if (code) rt_event(code);
 }
 
 static void rt_play_step(void) {
-    long long now = rt_now() - g_rt_t0; int n = g_rt_n; unsigned cp; float cx, cy; RtS* s;
+    long long now = rt_now() - g_rt_t0; int n = g_rt_n, i, ok; float cx, cy, wx, wy; RtS* s;
     if (n < 2) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); return; }
     if (now < 0) {                                               /* предстарт: сначала выставляем камеру в положение начала записи, стик ещё не трогаем */
         if (g_rt_camOn && !rt_cam_write(g_rt_s[0].c, g_rt_s[0].v)) { g_rt_camOn = 0; dlog("маршрут: камеру выставить не удалось, дальше только стик"); }
         return;
     }
     if (g_rt_wrote) {                                            /* кто-то (вы) изменил стик не так, как мы писали — уступаем */
-        if (!rt_read(g_rt_sel, &cp, &cx, &cy)) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(4); return; }
-        if (cp != g_rt_wp || rt_abs(cx - g_rt_wx) > 0.02f || rt_abs(cy - g_rt_wy) > 0.02f) {
-            /* значение не наше: НЕ перезаписываем (иначе будем бороться с пальцем и никогда не заметим касание); 3 шага подряд (~15 мс) — уступаем */
-            if (++g_rt_bad >= 3) {
+        if (!rt_stick_read(&cx, &cy)) { rt_play_stop(4); return; }
+        ok = 0;                                                  /* значение доходит до стика с задержкой в кадр: сверяем с несколькими последними записанными */
+        for (i = 0; i < 4; i++) if (rt_abs(cx - g_rt_wh[i][0]) <= 0.02f && rt_abs(cy - g_rt_wh[i][1]) <= 0.02f) ok = 1;
+        if (!ok) {
+            /* значение не наше: НЕ перезаписываем (иначе будем бороться с пальцем); 6 тиков подряд — уступаем */
+            if (++g_rt_bad >= 6) {
                 char t[200]; Buf b; b_init(&b, t, sizeof t);
-                b_s(&b, "маршрут: повтор прерван, ждали p/x/y = "); b_int(&b, g_rt_wp); b_ch(&b, '/'); b_fix(&b, g_rt_wx, 3); b_ch(&b, '/'); b_fix(&b, g_rt_wy, 3);
-                b_s(&b, ", прочитали "); b_int(&b, cp); b_ch(&b, '/'); b_fix(&b, cx, 3); b_ch(&b, '/'); b_fix(&b, cy, 3);
+                b_s(&b, "маршрут: повтор прерван, прочитали стик "); b_fix(&b, cx, 3); b_ch(&b, '/'); b_fix(&b, cy, 3);
                 dlog(t);
-                __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(2);
+                rt_play_stop(2);
             }
             return;
         }
@@ -336,14 +317,26 @@ static void rt_play_step(void) {
     while (g_rt_pi + 1 < n && (long long)g_rt_s[g_rt_pi + 1].t <= now) g_rt_pi++;
     s = &g_rt_s[g_rt_pi];
     if (g_rt_pi >= n - 1 && now >= (long long)g_rt_s[n - 1].t) {            /* дошли до конца записи: отпускаем стик */
-        rt_write(g_rt_sel, 0, 0, 0);
-        __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE);
-        rt_event(1);
+        rt_play_stop(1);
         return;
     }
     if (g_rt_camOn && !rt_cam_write(s->c, s->v)) { g_rt_camOn = 0; dlog("маршрут: камера пропала (режим камеры сменился?), дальше только стик"); }
-    if (!rt_write(g_rt_sel, s->p, s->x, s->y)) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(4); return; }
-    g_rt_wrote = 1; g_rt_wp = s->p; g_rt_wx = s->x; g_rt_wy = s->y;
+    if (s->p) {
+        if (!g_rt_down) { if (!rt_stick_send(1, 0, 0)) { rt_play_stop(4); return; } g_rt_down = 1; }
+        if (!rt_stick_send(2, s->x, s->y)) { rt_play_stop(4); return; }
+        wx = s->x; wy = s->y;
+    } else {
+        if (g_rt_down) { if (!rt_stick_send(3, 0, 0)) { rt_play_stop(4); return; } g_rt_down = 0; }
+        wx = 0; wy = 0;
+    }
+    g_rt_wh[g_rt_whi & 3][0] = wx; g_rt_wh[g_rt_whi & 3][1] = wy; g_rt_whi++;
+    g_rt_wrote = 1;
+}
+
+static void rt_tick(void) {                                        /* главный поток */
+    int mode = __atomic_load_n(&g_rt_mode, __ATOMIC_ACQUIRE);
+    g_rt_tickPending = 0;
+    if (mode == 1) rt_rec_step(); else if (mode == 2) rt_play_step();
 }
 
 static void* rt_worker(void* arg) {
@@ -351,8 +344,11 @@ static void* rt_worker(void* arg) {
     for (;;) {
         int mode = __atomic_load_n(&g_rt_mode, __ATOMIC_ACQUIRE);
         if (mode == 0) { usleep(40000); continue; }
-        if (mode == 1) rt_rec_step(); else rt_play_step();
-        usleep(5000);
+        if (!g_rt_tickPending || rt_now() - g_rt_tickT > 1000) {   /* предыдущий тик ещё не выполнен — не копим очередь (но если потерялся — ставим заново) */
+            g_rt_tickPending = 1; g_rt_tickT = rt_now();
+            rt_post();
+        }
+        usleep(12000);
     }
     return NULL;
 }
@@ -489,38 +485,28 @@ static int rt_my_pos(float* me) {
 static void b_pos(Buf* b, const float* p) { b_fix(b, p[0], 1); b_s(b, ", "); b_fix(b, p[1], 1); b_s(b, ", "); b_fix(b, p[2], 1); }
 static double rt_dist2(const float* a, const float* c) { double dx = a[0] - c[0], dy = a[1] - c[1]; return __builtin_sqrt(dx * dx + dy * dy); }   /* по горизонтали, как d2 в /near */
 
-static void rt_pick_joystick(void) {                                 /* какой из найденных — тот, что в записи */
-    int i, best = -1;
-    for (i = 0; i < g_rt_nj; i++) if (seq(g_rt_jh[i], g_rt_hn) && seq(g_rt_jv[i], g_rt_vn)) { if (best < 0 || i == g_rt_idx) best = i; }
-    if (best < 0 && g_rt_idx >= 0 && g_rt_idx < g_rt_nj) best = g_rt_idx;
-    g_rt_sel = best;
-}
-
-static void rt_handle_event(void) {                                  /* главный поток, из Post */
-    Buf b; char msg[360]; int e = g_rt_evt; float me[3];
-    g_rt_evt = 0;
+static void rt_report(int code) {                                  /* главный поток */
+    Buf b; char msg[360]; float me[3];
     b_init(&b, msg, sizeof msg);
-    if (e == 1) {
+    if (code == 1) {
         b_s(&b, "Маршрут пройден");
         if (g_rt_hasE && rt_my_pos(me)) { b_s(&b, ". До точки конца записи: "); b_fix(&b, rt_dist2(me, g_rt_E), 1); b_s(&b, " м"); }
-    } else if (e == 2) b_s(&b, "Маршрут: повтор прерван — вы взялись за джойстик");
-    else if (e == 3) b_s(&b, "Маршрут: запись заполнена, остановлена");
-    else if (e == 4) b_s(&b, "Маршрут: джойстик пропал (экран сменился?), остановлено. Повторите /route probe");
-    else if (e == 5) b_s(&b, "Маршрут: достигнут лимит 10 минут, остановлено");
+    } else if (code == 2) b_s(&b, "Маршрут: повтор прерван — вы взялись за стик");
+    else if (code == 3) { b_s(&b, "Маршрут: запись заполнена. "); rt_stop_rec(&b); }
+    else if (code == 4) b_s(&b, "Маршрут: стик пропал (HUD пересоздан?), остановлено. Повторите /route probe");
+    else if (code == 5) { b_s(&b, "Маршрут: лимит 10 минут. "); rt_stop_rec(&b); }
     else return;
     chat_say(msg);
 }
 
-static void rt_stop_rec(Buf* b) {
+static void rt_stop_rec(Buf* b) {                                  /* главный поток; режим записи уже выключен или выключается здесь */
     int n; float me[3];
     __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE);
-    usleep(40000);                                                   /* дать рабочему потоку закончить шаг */
     n = g_rt_n;
-    if (g_rt_sel < 0 || n < 1) { b_s(b, "Запись остановлена: вы так и не брались за джойстик, ничего не записано"); return; }
+    if (!g_rt_started || n < 1) { b_s(b, "Запись остановлена: вы так и не брались за стик, ничего не записано"); return; }
     rt_push((unsigned)(rt_now() - g_rt_t0), 0, 0, 0, g_rt_lc, g_rt_lv);   /* отпускание стика — чтобы повтор знал длительность */
     n = g_rt_n;
-    g_rt_idx = g_rt_sel;
-    { int i; for (i = 0; i < 64; i++) { g_rt_hn[i] = g_rt_jh[g_rt_sel][i]; g_rt_vn[i] = g_rt_jv[g_rt_sel][i]; } }
+    g_rt_idx = 0; g_rt_hn[0] = '-'; g_rt_hn[1] = 0; g_rt_vn[0] = '-'; g_rt_vn[1] = 0;
     g_rt_hasE = rt_my_pos(me); if (g_rt_hasE) { g_rt_E[0] = me[0]; g_rt_E[1] = me[1]; g_rt_E[2] = me[2]; }
     b_s(b, "Записано: "); b_int(b, n); b_s(b, " точек, "); b_fix(b, (double)g_rt_s[n - 1].t / 1000.0, 1); b_s(b, " с");
     if (g_rt_hasS && g_rt_hasE) { b_s(b, ", от старта до финиша по прямой "); b_fix(b, rt_dist2(g_rt_S, g_rt_E), 1); b_s(b, " м"); }
@@ -530,23 +516,22 @@ static void rt_stop_rec(Buf* b) {
 static void native_route_cmd(void* self, void* args, void* mi) {
     int w; Buf b; char msg[420]; float me[3];
     (void)self; (void)mi;
-    if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { rt_handle_event(); return; }   /* вызов из Post, не из чата */
-    nc_capture_ctx();                                                /* главный поток: берём контекст для сообщений по окончании */
+    if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { rt_tick(); return; }   /* вызов из Post (тик), не из чата */
+    nc_capture_ctx();                                                /* главный поток: берём контекст для тиков */
     w = rt_parse(args);
     dlog_i("нативная /route: вызвана, флаги ", w);
     b_init(&b, msg, sizeof msg);
 
     if (w & 32) {                                                    /* probe */
-        int i, nj = rt_find();
-        b_s(&b, "Джойстиков: "); b_int(&b, nj);
-        for (i = 0; i < nj; i++) {
-            unsigned p = 0; float x = 0, y = 0; rt_read(i, &p, &x, &y);
-            b_s(&b, " | #"); b_int(&b, i); b_ch(&b, ' '); b_s(&b, g_rt_jkey[i][0] ? g_rt_jkey[i] : "-"); b_ch(&b, ' '); b_s(&b, g_rt_jh[i][0] ? g_rt_jh[i] : "-"); b_ch(&b, '/'); b_s(&b, g_rt_jv[i][0] ? g_rt_jv[i] : "-");
-            b_s(&b, " нажат "); b_int(&b, p); b_s(&b, " ("); b_fix(&b, x, 2); b_s(&b, "; "); b_fix(&b, y, 2); b_ch(&b, ')');
-        }
-        b_s(&b, " | смещения m_Pressed/m_Delta: "); b_int(&b, g_rt_offP); b_ch(&b, '/'); b_int(&b, g_rt_offD);
+        int ok = rt_find();
+        if (ok) {
+            float x = 0, y = 0; int rd = rt_stick_read(&x, &y);
+            b_s(&b, "Стик найден: "); b_s(&b, g_rt_key[0] ? g_rt_key : "-");
+            b_s(&b, rd ? ", значение (" : ", значение НЕ читается ("); b_fix(&b, x, 2); b_s(&b, "; "); b_fix(&b, y, 2); b_ch(&b, ')');
+        } else b_s(&b, "Стик НЕ найден (причина в near.log)");
         if (rt_cam_find()) { float c = 0, v = 0; rt_cam_read(&c, &v); b_s(&b, " | камера: поворот "); b_fix(&b, c, 1); b_s(&b, ", наклон "); b_fix(&b, v, 1); }
         else b_s(&b, " | камера: НЕ найдена (см. near.log)");
+        b_s(&b, g_nc_ctx ? " | тики: да" : " | тики: НЕТ");
         dlog2("маршрут probe: ", msg);
         chat_say(msg);
         return;
@@ -555,52 +540,55 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         b_s(&b, "Маршрут: "); b_s(&b, g_rt_mode == 1 ? "идёт запись" : g_rt_mode == 2 ? "идёт повтор" : "ничего не идёт");
         b_s(&b, ", точек в памяти "); b_int(&b, g_rt_n);
         if (g_rt_n > 0) { b_s(&b, " ("); b_fix(&b, (double)g_rt_s[g_rt_n - 1].t / 1000.0, 1); b_s(&b, " с)"); }
-        b_s(&b, g_nc_ctx ? ", сообщения по окончании: да" : ", сообщения по окончании: нет (только near.log)");
+        b_s(&b, g_nc_ctx ? ", тики: да" : ", тики: нет");
         chat_say(msg);
         return;
     }
     if (w & 2) {                                                     /* stop */
         if (g_rt_mode == 1) { rt_stop_rec(&b); chat_say(msg); return; }
         if (g_rt_mode == 2) {
-            __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); usleep(40000);
-            rt_write(g_rt_sel, 0, 0, 0);
+            rt_play_stop(0);
             b_s(&b, "Повтор остановлен"); chat_say(msg); return;
         }
         b_s(&b, "Маршрут: сейчас ничего не идёт"); chat_say(msg); return;
     }
     if (w & 1) {                                                     /* rec */
         if (g_rt_mode) { b_s(&b, "Маршрут: сначала /route stop"); chat_say(msg); return; }
-        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным джойстиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
+        if (!g_nc_ctx) { b_s(&b, "Маршрут: нет главного потока для тиков (см. near.log)"); chat_say(msg); return; }
+        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным стиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         g_rt_camRec = rt_cam_find(); g_rt_lc = g_rt_lv = 0;
-        g_rt_n = 0; g_rt_sel = -1; g_rt_hasS = rt_my_pos(me); g_rt_hasE = 0;
+        g_rt_n = 0; g_rt_started = 0; g_rt_hasS = rt_my_pos(me); g_rt_hasE = 0;
         if (g_rt_hasS) { g_rt_S[0] = me[0]; g_rt_S[1] = me[1]; g_rt_S[2] = me[2]; }
+        g_rt_tickPending = 0;
         __atomic_store_n(&g_rt_mode, 1, __ATOMIC_RELEASE);
-        b_s(&b, "Запись маршрута: возьмитесь за левый джойстик и идите. Конец: /route stop. ");
+        b_s(&b, "Запись маршрута: возьмитесь за левый стик и идите. Конец: /route stop. ");
         b_s(&b, g_rt_camRec ? "Камера пишется вместе со стиком; прыжок и спринт не пишутся" : "Камера НЕ найдена: пишется только стик (при повторе камеру выставляйте сами); прыжок и спринт не пишутся");
         chat_say(msg);
         return;
     }
     if (w & 4) {                                                     /* play */
+        int i;
         if (g_rt_mode) { b_s(&b, "Маршрут: сначала /route stop"); chat_say(msg); return; }
         if (g_rt_n < 2 && rt_load() < 2) { b_s(&b, "Маршрут: записи нет. Сначала /route rec"); chat_say(msg); return; }
-        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным джойстиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
-        rt_pick_joystick();
-        if (g_rt_sel < 0) { b_s(&b, "Маршрут: джойстик из записи не найден среди экранных (/route probe)"); chat_say(msg); return; }
+        if (!g_nc_ctx) { b_s(&b, "Маршрут: нет главного потока для тиков (см. near.log)"); chat_say(msg); return; }
+        if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным стиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         if (g_rt_hasS && !(w & 64) && rt_my_pos(me)) {
             double d = rt_dist2(me, g_rt_S);
             if (d > 2.0) {
-                b_s(&b, "Маршрут: вы в "); b_fix(&b, d, 1); b_s(&b, " м от точки начала записи ("); b_pos(&b, g_rt_S);
+                b_s(&b, "Маршрут: вы в "); b_fix(&b, d, 1); b_s(&b, " м от точки начала записи (");  b_pos(&b, g_rt_S);
                 b_s(&b, "). Встаньте туда и повторите, или /route play force");
                 chat_say(msg); return;
             }
         }
         g_rt_camOn = 0;
         if (g_rt_camRec && !(w & 128)) g_rt_camOn = rt_cam_find();
+        for (i = 0; i < 4; i++) { g_rt_wh[i][0] = 0; g_rt_wh[i][1] = 0; }
+        g_rt_whi = 0; g_rt_down = 0; g_rt_tickPending = 0;
         g_rt_pi = 0; g_rt_wrote = 0; g_rt_bad = 0; g_rt_t0 = rt_now() + (g_rt_camOn ? 250 : 0);       /* с камерой — короткий предстарт: сначала выставляется она */
         __atomic_store_n(&g_rt_mode, 2, __ATOMIC_RELEASE);
         b_s(&b, "Повтор маршрута: "); b_fix(&b, (double)g_rt_s[g_rt_n - 1].t / 1000.0, 1); b_s(&b, " с. ");
         b_s(&b, g_rt_camOn ? "Камера выставляется сама. " : (g_rt_camRec ? (w & 128 ? "Камера — ваша (nocam). " : "Камеру выставить не удалось: смотрите туда же, куда при записи. ") : "В записи нет камеры: смотрите туда же, куда при записи. "));
-        b_s(&b, "Остановить: /route stop (или возьмитесь за джойстик)");
+        b_s(&b, "Остановить: /route stop (или возьмитесь за стик)");
         chat_say(msg);
         return;
     }
