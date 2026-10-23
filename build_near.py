@@ -9,6 +9,10 @@ import glob, os, platform, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
 src = os.path.join(here, 'hassle_near.c')
+nocol = os.path.join(here, 'hassle_nocol.c')      # необязательный модуль /nocol: он сам включает hassle_near.c; нет файла — собираем как раньше
+if os.path.exists(nocol):
+    src = nocol
+    print('модуль /nocol: найден hassle_nocol.c')
 
 def find_ndk():
     if len(sys.argv) > 1: return sys.argv[1]
