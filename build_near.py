@@ -14,6 +14,13 @@ if os.path.exists(nocol):
     src = nocol
     print('модуль /nocol: найден hassle_nocol.c')
 
+route = os.path.join(here, 'hassle_route.c')      # необязательный модуль /route: включает hassle_nocol.c (а тот — hassle_near.c); нет файла — собираем как раньше
+if os.path.exists(route):
+    if not os.path.exists(nocol):
+        sys.exit('hassle_route.c включает hassle_nocol.c — положите его рядом (или удалите hassle_route.c)')
+    src = route
+    print('модуль /route: найден hassle_route.c')
+
 def find_ndk():
     if len(sys.argv) > 1: return sys.argv[1]
     for k in ('ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT', 'ANDROID_NDK'):
