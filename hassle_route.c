@@ -27,9 +27,13 @@
  *     «тик» (механизм из /nocol), а время считает по монотонным часам, так что пропущенные кадры ничего не ломают.
  *   • Камера: Game.MainCamera.m_Aim (CinemachinePOV) → m_HorizontalAxis.Value (поворот, градусы) и m_VerticalAxis.Value (наклон).
  *     Пишется вместе со стиком; при повторе камера выставляется сначала (пауза ~0,25 с), потом повторяются и её повороты.
+ *   • Спринт: Hud.js включает его САМ, когда стик оттянут вверх дальше 1.3 (значения стика доходят до ~3.6): зовёт onScreenControlTouchStart("<Keyboard>/Space").
+ *     Эту кнопку нужно тоже повторять, иначе при повторе персонаж идёт шагом и приходит не туда. Поэтому мод пишет и повторяет ещё и
+ *     состояние кнопок <Keyboard>/Space, <Keyboard>/leftShift, <Keyboard>/c (читает их значение так же, как стик). Старая запись без кнопок
+ *     (в файле нет строки «B 1») повторяется со спринтом по правилу «стик вверх > 1.3 → Space».
  *   • Если во время повтора вы возьмётесь за стик сами, повтор прерывается (значение стика не совпадает с тем, что писал мод).
  *
- * Ограничения: повторяются стик и камера. Прыжок и спринт (кнопки) НЕ записываются. Положение игрока перед /route play проверяется
+ * Ограничения: повторяются стик, камера и кнопки Space/leftShift/c. Положение игрока перед /route play проверяется
  * по точке начала записи (не дальше 2 м). Во время повтора камера занята модом (/route play nocam — чтобы камеру держали вы).
  * Точность: игра идёт по кадрам, на длинном маршруте возможен небольшой снос; по окончании мод пишет, на сколько метров вы не дошли до конца записи.
  */
@@ -58,7 +62,7 @@ static int rt_api(void) {
 }
 
 /* ───────────── данные ───────────── */
-typedef struct { unsigned t; float x, y; unsigned p; float c, v; } RtS;   /* t — мс от начала, p — стик задет (x или y не 0), x/y — значение стика, c/v — поворот/наклон камеры */
+typedef struct { unsigned t; float x, y; unsigned p; float c, v; unsigned b; } RtS;   /* t — мс от начала, p — стик задет (x или y не 0), x/y — значение стика, c/v — поворот/наклон камеры, b — маска нажатых кнопок */
 static RtS g_rt_s[RT_MAX];
 static volatile int g_rt_n;
 static volatile int g_rt_mode;       /* 0 — ничего, 1 — запись, 2 — повтор */
@@ -74,6 +78,13 @@ static void* g_rt_st;  static void* g_rt_stk;                      /* OnWebViewS
 static void* g_rt_ctrl; static void* g_rt_ctrlk;                   /* InputControl этого стика (читаем значение) */
 static void *g_rt_mRead, *g_rt_mTS, *g_rt_mTM, *g_rt_mTE;          /* ReadUnprocessedValue/ReadValue, OnTouchStart, OnTouchMove(Vector2), OnTouchEnd */
 static char g_rt_key[64];
+#define RT_NB 3
+static const char* const g_rt_bpath[RT_NB] = { "<Keyboard>/Space", "<Keyboard>/leftShift", "<Keyboard>/c" };   /* бит 0 — Space (спринт/прыжок), бит 1 — leftShift, бит 2 — c (присесть) */
+static void *g_rt_bo[RT_NB], *g_rt_bok[RT_NB];                     /* OnWebViewScreenButton и его заголовок */
+static void *g_rt_bc[RT_NB], *g_rt_bck[RT_NB];                     /* InputControl кнопки и его заголовок */
+static void *g_rt_mBS[RT_NB], *g_rt_mBE[RT_NB], *g_rt_mBR[RT_NB]; /* OnTouchStart, OnTouchEnd, ReadValue */
+static int g_rt_btnRec;                                            /* в записи есть кнопки */
+static unsigned g_rt_bdown, g_rt_lb;                               /* какие кнопки сейчас держит мод (повтор) / последние записанные (запись) */
 static int g_rt_started;                                           /* в записи: за стик уже взялись */
 static long long g_rt_t0;
 static int g_rt_pi;
@@ -128,10 +139,40 @@ static int rt_stick_send(int what, float x, float y) {
     return exc ? 0 : 1;
 }
 
+/* кнопка i (главный поток): down = нажата ли; 0 — не читается */
+static int rt_btn_read(int i, int* down) {
+    void *r, *exc = NULL;
+    if (!g_rt_mBR[i] || !g_rt_bc[i] || !nc_obj_ok(g_rt_bc[i]) || *(void**)g_rt_bc[i] != g_rt_bck[i]) return 0;
+    r = A.runtime_invoke(g_rt_mBR[i], g_rt_bc[i], NULL, &exc);
+    if (exc || !r || !nc_readable((char*)r + HDR, 4)) return 0;
+    *down = *(const float*)((char*)r + HDR) > 0.5f;
+    return 1;
+}
+static unsigned rt_btn_mask(void) {
+    unsigned m = 0; int i, d;
+    for (i = 0; i < RT_NB; i++) if (rt_btn_read(i, &d) && d) m |= 1u << i;
+    return m;
+}
+static int rt_btn_send(int i, int start) {
+    void *exc = NULL; void* m = start ? g_rt_mBS[i] : g_rt_mBE[i];
+    if (!m || !g_rt_bo[i] || !nc_obj_ok(g_rt_bo[i]) || *(void**)g_rt_bo[i] != g_rt_bok[i]) return 0;
+    A.runtime_invoke(m, g_rt_bo[i], NULL, &exc);
+    return exc ? 0 : 1;
+}
+static void rt_btn_apply(unsigned want) {                          /* привести кнопки, которые держит мод, к маске want */
+    int i;
+    for (i = 0; i < RT_NB; i++) {
+        unsigned bit = 1u << i;
+        if (((want ^ g_rt_bdown) & bit) == 0) continue;
+        if (rt_btn_send(i, (want & bit) != 0)) g_rt_bdown = (want & bit) ? (g_rt_bdown | bit) : (g_rt_bdown & ~bit);
+    }
+}
+
 static int rt_find(void) {
     void *kc, *fd, *dict = NULL, *dk, *fe, *fc, *ent, *best = NULL; long cnt, i; int offE, offC, stride;
     char bestKey[64]; const char* bestCls = NULL;
     g_rt_st = g_rt_ctrl = g_rt_mRead = g_rt_mTS = g_rt_mTM = g_rt_mTE = NULL; g_rt_key[0] = 0; bestKey[0] = 0;
+    { int q; for (q = 0; q < RT_NB; q++) { g_rt_bo[q] = g_rt_bc[q] = g_rt_mBS[q] = g_rt_mBE[q] = g_rt_mBR[q] = NULL; } }
     if (!g_img) { dlog("маршрут: нет образа игры"); return 0; }
     kc = A.class_from_name(g_img, "Hassle.WebView.Controls", "OnScreenControls");
     if (!kc) { dlog("маршрут: класс OnScreenControls не найден"); return 0; }
@@ -158,6 +199,10 @@ static int rt_find(void) {
         cn = A.class_get_name(A.object_get_class(val));
         dlog2("маршрут: экранный элемент: ", k);
         dlog2("маршрут:    класс: ", cn ? cn : "?");
+        if (cn && seq(cn, "OnWebViewScreenButton")) {
+            int q;
+            for (q = 0; q < RT_NB; q++) if (seq(k, g_rt_bpath[q])) { g_rt_bo[q] = val; g_rt_bok[q] = *(void**)val; }
+        }
         if (cn && seq(cn, "OnWebViewScreenStick") && (!best || seq(k, RT_STICK))) {
             best = val; bestCls = cn;
             { int q; for (q = 0; q < 63 && k[q]; q++) bestKey[q] = k[q]; bestKey[q] = 0; }
@@ -184,6 +229,29 @@ static int rt_find(void) {
         g_rt_mRead = m1;
         if (!m1 || !rt_stick_read(&tx, &ty)) { g_rt_mRead = m2; if (!m2 || !rt_stick_read(&tx, &ty)) { g_rt_mRead = NULL; g_rt_st = g_rt_ctrl = NULL; dlog("маршрут: значение стика не читается (ReadUnprocessedValue/ReadValue)"); return 0; } }
         { int q; for (q = 0; q < 63 && bestKey[q]; q++) g_rt_key[q] = bestKey[q]; g_rt_key[q] = 0; }
+    }
+    {   /* кнопки Space/leftShift/c: не обязательны — не нашли, повторяем только стик */
+        int q, okn = 0;
+        for (q = 0; q < RT_NB; q++) {
+            void *bo = g_rt_bo[q], *bk, *ctrl; int dn;
+            if (!bo) { dlog2("маршрут: кнопка не найдена: ", g_rt_bpath[q]); continue; }
+            bk = A.object_get_class(bo);
+            g_rt_mBS[q] = find_method(bk, "OnTouchStart", 0);
+            g_rt_mBE[q] = find_method(bk, "OnTouchEnd", 0);
+            ctrl = ref_field_s(bo, "m_Control");
+            if (!ctrl || !nc_obj_ok(ctrl)) {
+                void *gm = find_method(bk, "get_control", 0), *exc = NULL;
+                ctrl = gm ? A.runtime_invoke(gm, bo, NULL, &exc) : NULL;
+                if (exc) ctrl = NULL;
+            }
+            if (ctrl && nc_obj_ok(ctrl)) {
+                g_rt_bc[q] = ctrl; g_rt_bck[q] = *(void**)ctrl;
+                g_rt_mBR[q] = find_method(A.object_get_class(ctrl), "ReadValue", 0);
+                if (!rt_btn_read(q, &dn)) { g_rt_mBR[q] = NULL; dlog2("маршрут: значение кнопки не читается: ", g_rt_bpath[q]); }
+            }
+            if (g_rt_mBS[q] && g_rt_mBE[q]) { okn++; dlog2("маршрут: кнопка найдена: ", g_rt_bpath[q]); }
+        }
+        dlog_i("маршрут: кнопок найдено ", okn);
     }
     dlog2("маршрут: стик найден, ключ ", g_rt_key);
     return 1;
@@ -248,38 +316,40 @@ static void rt_post(void) {                                        /* фонов
     if (exc) { exc_text(exc, et, sizeof et); dlog2("маршрут: Post бросил: ", et); g_rt_tickPending = 0; }
 }
 
-static void rt_push(unsigned t, unsigned p, float x, float y, float c, float v) {
+static void rt_push(unsigned t, unsigned p, float x, float y, float c, float v, unsigned b) {
     int n = g_rt_n;
     if (n >= RT_MAX) return;
-    g_rt_s[n].t = t; g_rt_s[n].p = p; g_rt_s[n].x = x; g_rt_s[n].y = y; g_rt_s[n].c = c; g_rt_s[n].v = v;
+    g_rt_s[n].t = t; g_rt_s[n].p = p; g_rt_s[n].x = x; g_rt_s[n].y = y; g_rt_s[n].c = c; g_rt_s[n].v = v; g_rt_s[n].b = b;
     __atomic_store_n(&g_rt_n, n + 1, __ATOMIC_RELEASE);
 }
 static float rt_abs(float v) { return v < 0 ? -v : v; }
 
 static void rt_stop_rec(Buf* b);
-static void rt_release_stick(void) {                               /* отпустить стик, если мы его держали */
+static void rt_release_stick(void) {                               /* отпустить стик и кнопки, если мы их держали */
     if (g_rt_down) { rt_stick_send(3, 0, 0); g_rt_down = 0; }
+    rt_btn_apply(0);
 }
 
 static void rt_rec_step(void) {
-    float x, y, c = 0, v = 0; unsigned p; long long now;
+    float x, y, c = 0, v = 0; unsigned p, b = 0; long long now;
     if (g_rt_camRec && !rt_cam_read(&c, &v)) { c = g_rt_lc; v = g_rt_lv; }
+    if (g_rt_btnRec) b = rt_btn_mask();
     if (!rt_stick_read(&x, &y)) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(4); return; }
     p = (x != 0 || y != 0) ? 1u : 0u;
     if (!g_rt_started) {                                           /* ждём, когда вы возьмётесь за стик */
         if (p) {
             g_rt_started = 1; g_rt_t0 = rt_now();
-            g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v;
+            g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v; g_rt_lb = b;
             g_rt_n = 0;
-            rt_push(0, p, x, y, c, v);
+            rt_push(0, p, x, y, c, v, b);
             dlog("маршрут: запись началась");
         }
         return;
     }
     now = rt_now() - g_rt_t0;
-    if (p != g_rt_lp || rt_abs(x - g_rt_lx) > 0.004f || rt_abs(y - g_rt_ly) > 0.004f || (g_rt_camRec && (rt_abs(c - g_rt_lc) > 0.15f || rt_abs(v - g_rt_lv) > 0.15f))) {
-        rt_push((unsigned)now, p, x, y, c, v);
-        g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v;
+    if (p != g_rt_lp || b != g_rt_lb || rt_abs(x - g_rt_lx) > 0.004f || rt_abs(y - g_rt_ly) > 0.004f || (g_rt_camRec && (rt_abs(c - g_rt_lc) > 0.15f || rt_abs(v - g_rt_lv) > 0.15f))) {
+        rt_push((unsigned)now, p, x, y, c, v, b);
+        g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v; g_rt_lb = b;
     }
     if (g_rt_n >= RT_MAX - 2) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(3); return; }
     if (now > RT_MAXMS) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(5); return; }
@@ -329,6 +399,8 @@ static void rt_play_step(void) {
         if (g_rt_down) { if (!rt_stick_send(3, 0, 0)) { rt_play_stop(4); return; } g_rt_down = 0; }
         wx = 0; wy = 0;
     }
+    if (g_rt_btnRec) rt_btn_apply(s->b & ((1u << RT_NB) - 1));
+    else rt_btn_apply((s->p && s->y > 1.3f) ? 1u : 0u);              /* запись без кнопок: спринт по правилу Hud.js (стик вверх > 1.3 → Space) */
     g_rt_wh[g_rt_whi & 3][0] = wx; g_rt_wh[g_rt_whi & 3][1] = wy; g_rt_whi++;
     g_rt_wrote = 1;
 }
@@ -375,10 +447,12 @@ static int rt_save(void) {
     if (g_rt_hasS) { b_s(&b, "S "); b_fix(&b, g_rt_S[0], 3); b_ch(&b, ' '); b_fix(&b, g_rt_S[1], 3); b_ch(&b, ' '); b_fix(&b, g_rt_S[2], 3); b_ch(&b, '\n'); }
     if (g_rt_hasE) { b_s(&b, "E "); b_fix(&b, g_rt_E[0], 3); b_ch(&b, ' '); b_fix(&b, g_rt_E[1], 3); b_ch(&b, ' '); b_fix(&b, g_rt_E[2], 3); b_ch(&b, '\n'); }
     if (g_rt_camRec) b_s(&b, "K 1\n");
+    if (g_rt_btnRec) b_s(&b, "B 1\n");
     for (i = 0; i < n; i++) {
         b_int(&b, (long)g_rt_s[i].t); b_ch(&b, ' '); b_int(&b, (long)g_rt_s[i].p); b_ch(&b, ' ');
         b_fix(&b, g_rt_s[i].x, 3); b_ch(&b, ' '); b_fix(&b, g_rt_s[i].y, 3);
-        if (g_rt_camRec) { b_ch(&b, ' '); b_fix(&b, g_rt_s[i].c, 2); b_ch(&b, ' '); b_fix(&b, g_rt_s[i].v, 2); }
+        if (g_rt_camRec || g_rt_btnRec) { b_ch(&b, ' '); b_fix(&b, g_rt_s[i].c, 2); b_ch(&b, ' '); b_fix(&b, g_rt_s[i].v, 2); }
+        if (g_rt_btnRec) { b_ch(&b, ' '); b_int(&b, (long)g_rt_s[i].b); }
         b_ch(&b, '\n');
         if (b.n > sizeof buf - 100) {
             if (!flog_write(path, b.p, b.n, first)) return 0;
@@ -413,7 +487,7 @@ static int rt_load(void) {
     for (;;) { long r = read(fd, g_rt_fbuf + tot, RT_FBUF - 1 - tot); if (r <= 0) break; tot += r; if (tot >= RT_FBUF - 1) break; }
     close(fd);
     g_rt_fbuf[tot] = 0;
-    g_rt_hasS = g_rt_hasE = 0; g_rt_hn[0] = g_rt_vn[0] = 0; g_rt_idx = -1; g_rt_camRec = 0;
+    g_rt_hasS = g_rt_hasE = 0; g_rt_hn[0] = g_rt_vn[0] = 0; g_rt_idx = -1; g_rt_camRec = 0; g_rt_btnRec = 0;
     for (p = g_rt_fbuf; *p; ) {
         const char* q = p;
         if (*q == 'H') {
@@ -430,12 +504,15 @@ static int rt_load(void) {
             }
         } else if (*q == 'K') {
             g_rt_camRec = 1;
+        } else if (*q == 'B') {
+            g_rt_btnRec = 1;
         } else if (*q >= '0' && *q <= '9') {
             if ((q = rt_num(q, &v[0])) && (q = rt_num(q, &v[1])) && (q = rt_num(q, &v[2])) && (q = rt_num(q, &v[3])) && cnt < RT_MAX) {
-                double cc = 0, vv = 0; const char* q2 = rt_num(q, &cc);
-                if (q2) rt_num(q2, &vv);
+                double cc = 0, vv = 0, bb = 0; const char* q2 = rt_num(q, &cc); const char* q3 = NULL;
+                if (q2) q3 = rt_num(q2, &vv);
+                if (q3) rt_num(q3, &bb);
                 g_rt_s[cnt].t = (unsigned)v[0]; g_rt_s[cnt].p = v[1] > 0.5 ? 1u : 0u; g_rt_s[cnt].x = (float)v[2]; g_rt_s[cnt].y = (float)v[3];
-                g_rt_s[cnt].c = (float)cc; g_rt_s[cnt].v = (float)vv;
+                g_rt_s[cnt].c = (float)cc; g_rt_s[cnt].v = (float)vv; g_rt_s[cnt].b = (unsigned)bb;
                 cnt++;
             }
         }
@@ -504,7 +581,7 @@ static void rt_stop_rec(Buf* b) {                                  /* главн
     __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE);
     n = g_rt_n;
     if (!g_rt_started || n < 1) { b_s(b, "Запись остановлена: вы так и не брались за стик, ничего не записано"); return; }
-    rt_push((unsigned)(rt_now() - g_rt_t0), 0, 0, 0, g_rt_lc, g_rt_lv);   /* отпускание стика — чтобы повтор знал длительность */
+    rt_push((unsigned)(rt_now() - g_rt_t0), 0, 0, 0, g_rt_lc, g_rt_lv, 0);   /* отпускание стика — чтобы повтор знал длительность */
     n = g_rt_n;
     g_rt_idx = 0; g_rt_hn[0] = '-'; g_rt_hn[1] = 0; g_rt_vn[0] = '-'; g_rt_vn[1] = 0;
     g_rt_hasE = rt_my_pos(me); if (g_rt_hasE) { g_rt_E[0] = me[0]; g_rt_E[1] = me[1]; g_rt_E[2] = me[2]; }
@@ -557,12 +634,14 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         if (!g_nc_ctx) { b_s(&b, "Маршрут: нет главного потока для тиков (см. near.log)"); chat_say(msg); return; }
         if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным стиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         g_rt_camRec = rt_cam_find(); g_rt_lc = g_rt_lv = 0;
+        { int q, d, any = 0; for (q = 0; q < RT_NB; q++) if (rt_btn_read(q, &d)) any = 1; g_rt_btnRec = any; g_rt_lb = 0; g_rt_bdown = 0; }
         g_rt_n = 0; g_rt_started = 0; g_rt_hasS = rt_my_pos(me); g_rt_hasE = 0;
         if (g_rt_hasS) { g_rt_S[0] = me[0]; g_rt_S[1] = me[1]; g_rt_S[2] = me[2]; }
         g_rt_tickPending = 0;
         __atomic_store_n(&g_rt_mode, 1, __ATOMIC_RELEASE);
         b_s(&b, "Запись маршрута: возьмитесь за левый стик и идите. Конец: /route stop. ");
-        b_s(&b, g_rt_camRec ? "Камера пишется вместе со стиком; прыжок и спринт не пишутся" : "Камера НЕ найдена: пишется только стик (при повторе камеру выставляйте сами); прыжок и спринт не пишутся");
+        b_s(&b, g_rt_camRec ? "Камера пишется вместе со стиком. " : "Камера НЕ найдена: пишется только стик (при повторе камеру выставляйте сами). ");
+        b_s(&b, g_rt_btnRec ? "Кнопки Space/Shift/C пишутся (спринт тоже)" : "Кнопки не читаются: спринт при повторе возьмётся по наклону стика");
         chat_say(msg);
         return;
     }
@@ -583,7 +662,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         g_rt_camOn = 0;
         if (g_rt_camRec && !(w & 128)) g_rt_camOn = rt_cam_find();
         for (i = 0; i < 4; i++) { g_rt_wh[i][0] = 0; g_rt_wh[i][1] = 0; }
-        g_rt_whi = 0; g_rt_down = 0; g_rt_tickPending = 0;
+        g_rt_whi = 0; g_rt_down = 0; g_rt_bdown = 0; g_rt_tickPending = 0;
         g_rt_pi = 0; g_rt_wrote = 0; g_rt_bad = 0; g_rt_t0 = rt_now() + (g_rt_camOn ? 250 : 0);       /* с камерой — короткий предстарт: сначала выставляется она */
         __atomic_store_n(&g_rt_mode, 2, __ATOMIC_RELEASE);
         b_s(&b, "Повтор маршрута: "); b_fix(&b, (double)g_rt_s[g_rt_n - 1].t / 1000.0, 1); b_s(&b, " с. ");
