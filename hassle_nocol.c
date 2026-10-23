@@ -53,15 +53,50 @@ static int nc_api(void) {
 }
 
 /* ───────────── безопасные помощники ───────────── */
-/* Ссылочное поле С ПРОВЕРКОЙ ТИПА: bool/число/структуру как указатель не читаем. */
+/* Можно ли безопасно читать n байт по адресу p. Проверка через write() в неблокирующий pipe: ядро копирует память пользователя
+   и при недоступной странице вернёт короткую запись / EFAULT вместо падения игры. Нужна, потому что в списках игроков и NPC
+   бывают устаревшие записи, и разыменовать «мусорный» указатель = вылет или зависание. */
+extern int pipe(int*);
+extern int fcntl(int, int, ...);
+static int g_nc_pipe[2] = { -1, -1 }; static volatile int g_nc_pipeLock;
+static int nc_readable(const void* p, unsigned n) {
+    char buf[64]; long w; int ok;
+    if (!p || (uptr)p < 0x10000 || n == 0 || n > sizeof buf) return 0;
+    while (__sync_lock_test_and_set(&g_nc_pipeLock, 1)) usleep(50);
+    if (g_nc_pipe[0] == -1) {
+        if (pipe(g_nc_pipe)) g_nc_pipe[0] = -2;
+        else { fcntl(g_nc_pipe[0], 4, 0x800); fcntl(g_nc_pipe[1], 4, 0x800); }       /* F_SETFL, O_NONBLOCK */
+    }
+    if (g_nc_pipe[0] < 0) { __sync_lock_release(&g_nc_pipeLock); return 1; }            /* pipe не создался — проверить не можем */
+    w = write(g_nc_pipe[1], p, n);
+    ok = (w == (long)n);
+    if (w > 0) while (read(g_nc_pipe[0], buf, sizeof buf) > 0) {}
+    __sync_lock_release(&g_nc_pipeLock);
+    return ok;
+}
+/* объект живой на вид: заголовок читается и указатель на класс ведёт в читаемую память */
+static int nc_obj_ok(const void* o) { return o && nc_readable(o, 16) && nc_readable(*(void* const*)o, 16); }
+/* вся область [p, p+bytes) читается: по одному байту на страницу и последний байт */
+static int nc_range_ok(const void* p, long bytes) {
+    long o;
+    if (!p || bytes <= 0 || bytes > (1L << 22)) return 0;
+    for (o = 0; o < bytes; o += 4096) if (!nc_readable((const char*)p + o, 1)) return 0;
+    return nc_readable((const char*)p + bytes - 1, 1);
+}
+/* Ссылочное поле С ПРОВЕРКОЙ ТИПА и памяти: bool/число/структуру как указатель не читаем, «мусорный» объект не трогаем. */
 static void* ref_field_s(void* obj, const char* name) {
-    void* f; int tk;
-    if (!obj) return NULL;
-    f = find_field(A.object_get_class(obj), name);
+    void *k, *f; int tk, off;
+    if (!obj || !nc_readable(obj, 16)) return NULL;
+    k = *(void**)obj;
+    if (!nc_readable(k, 16)) return NULL;                       /* указатель на класс должен вести в живую память */
+    k = A.object_get_class(obj);
+    f = find_field(k, name);
     if (!f) return NULL;
     tk = A.type_get_type(A.field_get_type(f));
     if (!(tk == 0x12 || tk == 0x15 || tk == 0x1c || tk == 0x0e || tk == 0x1d || tk == 0x14)) return NULL;   /* CLASS, GENERICINST, OBJECT, STRING, SZARRAY, ARRAY */
-    return *(void**)((char*)obj + A.field_get_offset(f));
+    off = A.field_get_offset(f);
+    if (off < 0 || off > 0x2000 || !nc_readable((char*)obj + off, sizeof(void*))) return NULL;
+    return *(void**)((char*)obj + off);
 }
 static void* find_image_pre(const char* pre) {
     uptr n = 0, i; void** as;
@@ -90,6 +125,14 @@ static void* find_method_p(void* k, const char* name, int argc, const char* p0su
     }
     return NULL;
 }
+/* массив: заголовок и все элементы читаются, длина разумная */
+static int nc_arr_ok(void* arr, int esz) {
+    long len;
+    if (!arr || esz <= 0 || !nc_readable(arr, 32) || !nc_readable(*(void**)arr, 16)) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 100000) return 0;
+    return len == 0 || nc_range_ok(arr, 4 * (long)sizeof(void*) + len * esz);
+}
 /* обход List<T> и Dictionary<int,T> (без шума в журнале; других коллекций здесь нет) */
 static int nc_walk(void* coll, item_cb cb, void* ctx) {
     const char* nm; void* arr;
@@ -97,12 +140,13 @@ static int nc_walk(void* coll, item_cb cb, void* ctx) {
     nm = A.class_get_name(A.object_get_class(coll));
     if (sprefix(nm, "List`1")) {
         arr = ref_field_s(coll, "_items");
+        if (!nc_arr_ok(arr, (int)sizeof(void*))) return 0;
         walk_ref_array(arr, int_field(coll, "_size", NULL, NULL, -1), 1, cb, ctx);
         return 1;
     }
     if (sprefix(nm, "Dictionary`2")) {
         arr = ref_field_s(coll, "_entries");
-        if (arr) { walk_struct_array(arr, int_field(coll, "_count", NULL, NULL, -1), "value", cb, ctx); return 1; }
+        if (arr && nc_arr_ok(arr, A.class_array_element_size(A.object_get_class(arr)))) { walk_struct_array(arr, int_field(coll, "_count", NULL, NULL, -1), "value", cb, ctx); return 1; }
     }
     return 0;
 }
@@ -201,9 +245,11 @@ static void nc_call_phys(void* a, void* b, u8 ign, NcRes* r) {
 
 /* ───────────── «подпись» набора целей (только управляемые поля — можно звать из фонового потока) ───────────── */
 typedef struct { uptr sum, xr; int n; void* me; } NcSig;
+static int g_nc_verb;                              /* 1 — пишем в журнал каждый шаг (только внутри /nocol) */
 static void nc_sig_cb(void* item, void* ctx) {
     NcSig* s = (NcSig*)ctx; void* c;
     if (!item || item == s->me) return;
+    if (g_nc_verb && s->n < 40) { dlog_i("нативная /nocol:    подпись: цель ", s->n); if (nc_obj_ok(item)) dlog2("нативная /nocol:       класс: ", A.class_get_name(A.object_get_class(item))); else dlog("нативная /nocol:       указатель недоступен, пропускаю"); }
     c = nc_capsule(nc_movement(item));
     s->n++;
     if (c) { s->sum += ((uptr)c >> 3) * 2654435761u; s->xr ^= (uptr)c; }
@@ -264,7 +310,9 @@ static void nc_apply(int ignore, NcRes* r) {
         g_nc_logged = 1;
         dlog2("нативная /nocol: IgnoreCollision(Collider,bool) у вашего движения: ", lign ? "найден" : "НЕ найден");
     }
-    sig0 = nc_sig();                                   /* ДО обхода: кто придёт во время обхода — вызовет повтор */
+    dlog("нативная /nocol: шаг 2б: считаю подпись целей");
+    g_nc_verb = 1; sig0 = nc_sig(); g_nc_verb = 0;      /* ДО обхода: кто придёт во время обхода — вызовет повтор */
+    dlog("нативная /nocol: шаг 2в: подпись посчитана");
 
     g_nc_nt = 0;
     stream = ref_field_s(pool, "PlayersInStream");
@@ -277,17 +325,28 @@ static void nc_apply(int ignore, NcRes* r) {
     dlog_i("нативная /nocol: шаг 3: собрано целей (NPC) ", r->actors);
 
     for (t = 0; t < g_nc_nt; t++) {
-        void* tm = nc_movement(g_nc_t[t]); void* c; void* tign;
-        if (!tm) continue;
+        void* tm; void* c; void* tign; int v = t < 40;
+        if (v) dlog_i("нативная /nocol: цель ", t);
+        if (!nc_obj_ok(g_nc_t[t])) { if (v) dlog("нативная /nocol:    объект недоступен, пропуск"); continue; }
+        if (v) dlog2("нативная /nocol:    класс: ", A.class_get_name(A.object_get_class(g_nc_t[t])));
+        tm = nc_movement(g_nc_t[t]);
+        if (!tm) { if (v) dlog("нативная /nocol:    нет движения, пропуск"); continue; }
         c = nc_capsule(tm);
-        if (!c || c == lcap) continue;
-        if (!nc_active(c)) { r->skipped++; continue; }
+        if (!c || c == lcap) { if (v) dlog("нативная /nocol:    нет капсулы (или это вы), пропуск"); continue; }
+        if (!nc_obj_ok(c)) { if (v) dlog("нативная /nocol:    капсула недоступна, пропуск"); r->skipped++; continue; }
+        if (v) dlog("нативная /nocol:    проверяю активность капсулы");
+        if (!nc_active(c)) { r->skipped++; if (v) dlog("нативная /nocol:    капсула неактивна, пропуск"); continue; }
         r->cols++;
+        if (v) dlog("нативная /nocol:    IgnoreCollision у вашего движения");
         if (lign) nc_call_ign(lign, lmv, c, ign, r);                 /* ваше движение игнорирует чужую капсулу */
+        if (v) dlog("нативная /nocol:    Physics.IgnoreCollision");
         nc_call_phys(lcap, c, ign, r);                               /* и на уровне физики Unity */
         tign = nc_ign_method(tm);                                    /* обратно: движение цели игнорирует вашу капсулу (если она сама толкает вас) */
+        if (v) dlog("нативная /nocol:    IgnoreCollision у движения цели");
         if (tign && lcap) nc_call_ign(tign, tm, lcap, ign, r);
+        if (v) dlog("нативная /nocol:    готово");
     }
+    dlog("нативная /nocol: цикл по целям завершён");
     if (sig0) g_nc_sig = sig0;
     g_nc_applyT = NC_NOW(); g_nc_skipped = r->skipped;
     {
