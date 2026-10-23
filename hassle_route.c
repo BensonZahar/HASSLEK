@@ -11,6 +11,7 @@
  *   /route play           повторить записанный маршрут (без записи в памяти — берёт HLOG/route.txt)
  *   /route play force     то же, но без проверки «вы стоите там же, где начинали запись»
  *   /route play nocam     повтор без выставления камеры (камеру держите сами)
+ *   /route play 80        то же, но опережение задать вручную, мс (0 — как раньше, без опережения; по умолчанию авто = длина кадра)
  *   /route status         состояние
  *   /route probe          найти экранный стик и показать его значение (диагностика)
  *
@@ -89,6 +90,13 @@ static int g_rt_btnRec;                                            /* в зап�
 static unsigned g_rt_bdown, g_rt_lb;                               /* какие кнопки сейчас держит мод (повтор) / последние записанные (запись) */
 static int g_rt_started;                                           /* в записи: за стик уже взялись */
 static long long g_rt_t0;
+/* Опережение повтора. Запись читает стик в кадре k и это значение двигало персонажа за интервал ДО этого кадра (значение уже было обработано
+   Input System). Повтор пишет значение в кадре k, а в движение оно попадает только в СЛЕДУЮЩЕМ кадре, поэтому повтор всегда отстаёт примерно
+   на кадр (в эмуляторе кадр ~50-60 мс, при 4-5 м/с это 0.25 м и больше). Лечится выбором записанного значения не на «сейчас», а на «сейчас + кадр». */
+static long long g_rt_lastTk;                                      /* когда был предыдущий тик повтора */
+static float g_rt_dtEma = 55.0f;                                   /* средний интервал между тиками (≈ длительность кадра), мс */
+static float g_rt_lead;                                            /* опережение, применённое в последнем тике, мс */
+static int g_rt_leadArg = -1;                                      /* /route play <мс> — задать опережение вручную; -1 — авто (= длина кадра) */
 static int g_rt_pi;
 static int g_rt_wrote, g_rt_bad, g_rt_down, g_rt_whi;
 static float g_rt_wh[4][2];                                        /* последние записанные значения (стик обновляется с задержкой в кадр) */
@@ -459,8 +467,18 @@ static void rt_play_stop(int code) {
 }
 
 static void rt_play_step(void) {
-    long long now = rt_now() - g_rt_t0; int n = g_rt_n, i, ok; float cx, cy, wx, wy; RtS* s;
+    long long tnow = rt_now(), now = tnow - g_rt_t0, look; int n = g_rt_n, i, ok; float cx, cy, wx, wy; RtS* s;
     if (n < 2) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); return; }
+    if (g_rt_lastTk) {                                           /* длина кадра = интервал между тиками (тик идёт раз за кадр) */
+        float d = (float)(tnow - g_rt_lastTk);
+        if (d < 5.0f) d = 5.0f;
+        if (d > 200.0f) d = 200.0f;
+        g_rt_dtEma += (d - g_rt_dtEma) * 0.1f;
+    }
+    g_rt_lastTk = tnow;
+    g_rt_lead = g_rt_leadArg >= 0 ? (float)g_rt_leadArg : g_rt_dtEma;
+    if (g_rt_lead > 250.0f) g_rt_lead = 250.0f;
+    look = now + (long long)(g_rt_lead + 0.5f);                  /* по этому времени выбираем записанный стик/кнопки/камеру */
     if (now < 0) {                                               /* предстарт: сначала выставляем камеру в положение начала записи, стик ещё не трогаем */
         if (g_rt_camOn && !rt_cam_write(g_rt_s[0].c, g_rt_s[0].v)) { g_rt_camOn = 0; dlog("маршрут: камеру выставить не удалось, дальше только стик"); }
         return;
@@ -493,14 +511,15 @@ static void rt_play_step(void) {
                 g_rt_lastDevLog = now;
                 b_s(&b, "маршрут: повтор t="); b_fix(&b, (double)now / 1000.0, 1); b_s(&b, " с, отклонение от записи "); b_fix(&b, dev, 2);
                 b_s(&b, " м (Δ "); b_fix(&b, dx, 2); b_s(&b, ", "); b_fix(&b, dy, 2); b_s(&b, ", "); b_fix(&b, dz, 2); b_ch(&b, ')');
+                b_s(&b, ", кадр "); b_fix(&b, g_rt_dtEma, 0); b_s(&b, " мс, опережение "); b_fix(&b, g_rt_lead, 0); b_s(&b, " мс");
                 dlog(t);
                 rt_log_state("повтор", now);
             }
         }
     }
-    while (g_rt_pi + 1 < n && (long long)g_rt_s[g_rt_pi + 1].t <= now) g_rt_pi++;
+    while (g_rt_pi + 1 < n && (long long)g_rt_s[g_rt_pi + 1].t <= look) g_rt_pi++;
     s = &g_rt_s[g_rt_pi];
-    if (g_rt_pi >= n - 1 && now >= (long long)g_rt_s[n - 1].t) {            /* дошли до конца записи: отпускаем стик */
+    if (g_rt_pi >= n - 1 && look >= (long long)g_rt_s[n - 1].t) {            /* дошли до конца записи: отпускаем стик */
         rt_play_stop(1);
         return;
     }
@@ -654,6 +673,7 @@ static int rt_load(void) {
 /* слова: 1 rec/record, 2 stop/cancel, 4 play, 16 status, 32 probe, 64 force, 128 nocam */
 static int rt_parse(void* arr) {
     long len; int i, w = 0; char* data;
+    g_rt_leadArg = -1;
     if (!arr) return 0;
     len = *(long*)((char*)arr + 3 * sizeof(void*));
     if (len < 0 || len > 16) return 0;
@@ -677,6 +697,7 @@ static int rt_parse(void* arr) {
             else if (seq(tok, "probe")) w |= 32;
             else if (seq(tok, "force")) w |= 64;
             else if (seq(tok, "nocam")) w |= 128;
+            else if (tok[0] >= '0' && tok[0] <= '9') { int v = 0, k; for (k = 0; tok[k] >= '0' && tok[k] <= '9' && k < 6; k++) v = v * 10 + (tok[k] - '0'); g_rt_leadArg = v > 250 ? 250 : v; }
         }
     }
     return w;
@@ -805,7 +826,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         if (g_rt_hasS && rt_my_pos(me)) { g_rt_startDev[0] = me[0] - g_rt_S[0]; g_rt_startDev[1] = me[1] - g_rt_S[1]; g_rt_startDev[2] = me[2] - g_rt_S[2]; }
         g_rt_maxDev = 0; g_rt_maxDevT = 0; g_rt_ppi = 0; g_rt_lastDev = -1000; g_rt_lastDevLog = -1000;
         for (i = 0; i < 4; i++) { g_rt_wh[i][0] = 0; g_rt_wh[i][1] = 0; }
-        g_rt_whi = 0; g_rt_down = 0; g_rt_bdown = 0; g_rt_tickPending = 0;
+        g_rt_whi = 0; g_rt_down = 0; g_rt_bdown = 0; g_rt_tickPending = 0; g_rt_lastTk = 0; g_rt_dtEma = 55.0f; g_rt_lead = 0;
         g_rt_pi = 0; g_rt_wrote = 0; g_rt_bad = 0; g_rt_t0 = rt_now() + (g_rt_camOn ? 250 : 0);       /* с камерой — короткий предстарт: сначала выставляется она */
         __atomic_store_n(&g_rt_mode, 2, __ATOMIC_RELEASE);
         b_s(&b, "Повтор маршрута: "); b_fix(&b, (double)g_rt_s[g_rt_n - 1].t / 1000.0, 1); b_s(&b, " с. ");
@@ -815,6 +836,8 @@ static void native_route_cmd(void* self, void* args, void* mi) {
             if (g_rt_hasS && sd > 0.25) { b_s(&b, "Вы в "); b_fix(&b, sd, 2); b_s(&b, " м от точки старта (Δ "); b_fix(&b, sx, 2); b_s(&b, ", "); b_fix(&b, sy, 2); b_s(&b, ", "); b_fix(&b, sz, 2); b_s(&b, ") — повтор сместится на столько же. "); }
             dlog_i("маршрут: старт повтора, смещение от точки начала записи, см: ", (long)(sd * 100.0));
         }
+        b_s(&b, g_rt_leadArg >= 0 ? "Опережение вручную: " : "Опережение авто (на кадр вперёд). ");
+        if (g_rt_leadArg >= 0) { b_int(&b, g_rt_leadArg); b_s(&b, " мс. "); }
         b_s(&b, "Остановить: /route stop (или возьмитесь за стик)");
         chat_say(msg);
         return;
