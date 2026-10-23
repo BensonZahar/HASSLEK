@@ -26,7 +26,7 @@
  *
  * /nocol — отключить столкновения со всеми игроками и NPC (только на вашем клиенте, сервер ничего не знает).
  *   Игроки — PlayerPool.PlayersInStream, NPC — Pools.Actors (RPC Hassle.Global.NPC создаёт Actor'ов). Берём капсулу каждого
- *   (Character.Movement/SimpleMovement → _capsuleCollider / m_Collider) и в главном потоке зовём у вашего движения
+ *   (Actor.m_Controller → Character.Movement → _capsuleCollider / m_Collider) и в главном потоке зовём у вашего движения
  *   IgnoreCollision(Collider, true) + Physics.IgnoreCollision. По слою нельзя: у игры нет слоя «персонажи» (капсулы на Default вместе с миром).
  *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
@@ -324,6 +324,17 @@ static void* ref_field(void* obj, const char* name) {   /* значение сс
     if (!f) return NULL;
     v = *(void**)((char*)obj + A.field_get_offset(f));
     return v;
+}
+/* Ссылочное поле С ПРОВЕРКОЙ ТИПА: bool/число/структуру как указатель не читаем. Именно так «/nocol» уронил игру: Character.SimpleMovement —
+   это bool по смещению 0x5E, а не объект, и 8 байт оттуда (bool + чужое поле) ушли в object_get_class как указатель. */
+static void* ref_field_s(void* obj, const char* name) {
+    void* f; int tk;
+    if (!obj) return NULL;
+    f = find_field(A.object_get_class(obj), name);
+    if (!f) return NULL;
+    tk = A.type_get_type(A.field_get_type(f));
+    if (!(tk == 0x12 || tk == 0x15 || tk == 0x1c || tk == 0x0e || tk == 0x1d || tk == 0x14)) return NULL;   /* CLASS, GENERICINST, OBJECT, STRING, SZARRAY, ARRAY */
+    return *(void**)((char*)obj + A.field_get_offset(f));
 }
 static int field_is_valuetype(void* f) {
     void* t = A.field_get_type(f);
@@ -1326,26 +1337,23 @@ static void* nc_ign_method(void* obj) {
     return m;
 }
 
-/* компоненты движения актёра: Actor.m_Controller (Character) → Movement (ECM2 CharacterMovement) и/или SimpleMovement (SimpleCharacterMovement) */
+/* компонент движения актёра: Actor.m_Controller (ThirdPersonCharacter) → Movement (ICharacterMovement: ECM2 CharacterMovement либо SimpleCharacterMovement).
+   Character.SimpleMovement — это bool («использовать простое движение»), как объект его читать НЕЛЬЗЯ. Возвращает 0 или 1 объект. */
 static int nc_movements(void* actor, void** out, int cap) {
-    static const char* nm[2] = { "Movement", "SimpleMovement" };
-    void* ctrl = ref_field(actor, "m_Controller"); int n = 0, i, j;
+    void* ctrl = ref_field_s(actor, "m_Controller"); void* mv;
     if (!ctrl) {
         void* m = find_method(A.object_get_class(actor), "get_Controller", 0);
         if (m) { void* exc = NULL; ctrl = A.runtime_invoke(m, actor, NULL, &exc); if (exc) ctrl = NULL; }
     }
-    if (!ctrl) return 0;
-    for (i = 0; i < 2 && n < cap; i++) {
-        void* mv = ref_field(ctrl, nm[i]); int dup = 0;
-        if (!mv) continue;
-        for (j = 0; j < n; j++) if (out[j] == mv) dup = 1;
-        if (!dup) out[n++] = mv;
-    }
-    return n;
+    if (!ctrl || cap < 1) return 0;
+    mv = ref_field_s(ctrl, "Movement");
+    if (!mv) return 0;
+    out[0] = mv;
+    return 1;
 }
 static void* nc_capsule(void* mv) {
-    void* c = ref_field(mv, "_capsuleCollider");       /* ECM2 CharacterMovement */
-    if (!c) c = ref_field(mv, "m_Collider");           /* SimpleCharacterMovement */
+    void* c = ref_field_s(mv, "_capsuleCollider");     /* ECM2 CharacterMovement */
+    if (!c) c = ref_field_s(mv, "m_Collider");         /* SimpleCharacterMovement */
     return c;
 }
 /* коллайдер жив и его объект активен (Physics.IgnoreCollision на неактивных ругается ошибкой в логе Unity) */
@@ -1395,19 +1403,21 @@ static void nc_apply(int ignore, NcRes* r) {
     if (!g_poolSrcField) { nc_err(r, "пул игроков ещё не найден, подождите пару секунд"); return; }
     pool = current_pool();
     if (!pool) { nc_err(r, "вы не в игре (пул игроков не создан)"); return; }
-    g_nc_me = ref_field(pool, "LocalPlayer");
+    g_nc_me = ref_field_s(pool, "LocalPlayer");
     if (!g_nc_me) { nc_err(r, "ваш персонаж ещё не создан"); return; }
     nl = nc_movements(g_nc_me, lmv, 2);
     if (nl <= 0) {
         nc_err(r, "у вашего персонажа не найден компонент движения (подробности в near.log)");
         if (!g_nc_ctrlDumped) {
-            void* ctrl = ref_field(g_nc_me, "m_Controller");
+            void* ctrl = ref_field_s(g_nc_me, "m_Controller");
             g_nc_ctrlDumped = 1;
             dump_class(ctrl ? A.object_get_class(ctrl) : A.object_get_class(g_nc_me), ctrl ? "контроллер игрока (Character)" : "LocalPlayer (нет m_Controller)");
         }
         return;
     }
+    dlog2("нативная /nocol: шаг 1: движение игрока найдено: ", A.class_get_name(A.object_get_class(lmv[0])));
     for (i = 0; i < nl; i++) lcap[i] = nc_capsule(lmv[i]);
+    dlog2("нативная /nocol: шаг 2: капсула игрока: ", lcap[0] ? "найдена" : "НЕ найдена");
     if (!g_nc_physTried) {
         void* img = find_image_pre("UnityEngine.PhysicsModule");
         void* kp = img ? A.class_from_name(img, "UnityEngine", "Physics") : NULL;
@@ -1425,12 +1435,14 @@ static void nc_apply(int ignore, NcRes* r) {
     }
 
     g_nc_nt = 0;
-    stream = ref_field(pool, "PlayersInStream");
+    stream = ref_field_s(pool, "PlayersInStream");
     if (stream) walk_collection_x(stream, nc_collect_cb, NULL, 1);
     r->players = g_nc_nt; n0 = g_nc_nt;
     apool = current_actor_pool();
-    if (apool) { items = ref_field(apool, "m_Items"); if (items) walk_collection_x(items, nc_collect_cb, NULL, 1); }
+    if (apool) { items = ref_field_s(apool, "m_Items"); if (items) walk_collection_x(items, nc_collect_cb, NULL, 1); }
     r->actors = g_nc_nt - n0;
+    dlog_i("нативная /nocol: шаг 3: собрано целей (игроки) ", r->players);
+    dlog_i("нативная /nocol: шаг 3: собрано целей (NPC) ", r->actors);
 
     for (t = 0; t < g_nc_nt; t++) {
         void *tm[2], *cols[2]; int nt = nc_movements(g_nc_t[t], tm, 2), nc = 0;
