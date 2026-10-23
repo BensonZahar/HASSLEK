@@ -8,8 +8,8 @@
  * клиент отправляет тот же RPC, что и при обычном входе.
  *
  * Команда в чате (нативная, как /rec и /nocol):
- *   /pk        ближайший пикап в пределах 3 м
- *   /pk 5      то же, но в пределах 5 м (1…20)
+ *   /pk        ближайший пикап в пределах 5 м
+ *   /pk 10     то же, но в пределах 10 м (1…20)
  *
  * hassle_near.c НЕ МЕНЯЕТСЯ. Этот файл включает hassle_nocol.c (если он лежит рядом) или hassle_near.c и добавляет /pk сверху.
  * build_near.py собирает самый «верхний» из файлов: hassle_pickup.c → hassle_nocol.c → hassle_near.c.
@@ -170,14 +170,14 @@ static void pk_say(const char* a, long num, const char* b) {
 }
 
 static void native_pk_cmd(void* self, void* args, void* mi) {
-    float me[3], p[3], bestd2 = 0; int radius, i, best = -1, inRange = 0; void *lcap, *bestObj = NULL, *exc = NULL, *a[1];
+    float me[3], p[3], bestd2 = 0, allD2 = 0; int radius, i, best = -1, inRange = 0, allIdx = -1, failed = 0; void *lcap, *bestObj = NULL, *exc = NULL, *a[1];
     (void)self; (void)mi;
     dlog("нативная /pk: вызвана");
     if (!g_safe) { chat_say("Метка: мод Near ещё стартует, подождите"); return; }
     if (!il2cpp_light()) { chat_say("Метка: IL2CPP ещё не готов"); return; }
     ensure_attached();
     if (!g_poolSrcField || !current_pool()) { chat_say("Метка: вы не в игре (пул игроков не создан)"); return; }
-    radius = pk_radius(args); if (!radius) radius = 3;
+    radius = pk_radius(args); if (!radius) radius = 5;
     lcap = pk_local_capsule();
     if (!lcap) { chat_say("Метка: не нашёл вашу капсулу (подробности в near.log)"); dlog("нативная /pk: нет капсулы игрока"); return; }
     if (!pk_pos(lcap, me)) { chat_say("Метка: не удалось прочитать вашу позицию"); dlog("нативная /pk: нет позиции игрока"); return; }
@@ -185,13 +185,24 @@ static void native_pk_cmd(void* self, void* args, void* mi) {
     dlog_i("нативная /pk: пикапов в мире у клиента ", g_pk_n);
     for (i = 0; i < g_pk_n; i++) {
         float dx, dy, dz, d2;
-        if (!pk_pos(g_pk_list[i], p)) continue;
+        if (!pk_pos(g_pk_list[i], p)) { failed++; continue; }
         dx = p[0] - me[0]; dy = p[1] - me[1]; dz = p[2] - me[2]; d2 = dx * dx + dy * dy + dz * dz;
+        if (allIdx < 0 || d2 < allD2) { allIdx = i; allD2 = d2; }
         if (d2 > (float)(radius * radius)) continue;
         inRange++;
         if (best < 0 || d2 < bestd2) { best = i; bestd2 = d2; }
     }
-    if (best < 0) { pk_say("Метка: рядом (до ", radius, " м) нет пикапов. Подойдите ближе или /pk с большим числом метров"); return; }
+    if (best < 0) {
+        char msg[300]; Buf x; b_init(&x, msg, sizeof msg);
+        b_s(&x, "Метка: в радиусе "); b_int(&x, radius); b_s(&x, " м нет пикапов (в клиенте их "); b_int(&x, g_pk_n);
+        b_s(&x, ", позицию не прочитал у "); b_int(&x, failed); b_s(&x, ")");
+        if (allIdx >= 0) {
+            int dd = 0, k; for (k = 0; k < 2000 && (float)((k + 1) * (k + 1)) <= allD2; k++) dd = k + 1;
+            b_s(&x, ". Ближайший №"); b_int(&x, int_field(g_pk_list[allIdx], "m_ID", NULL, NULL, -1)); b_s(&x, " в "); b_int(&x, dd); b_s(&x, " м");
+        }
+        dlog_i("нативная /pk: в радиусе пусто; пикапов ", g_pk_n); dlog_i("нативная /pk:    не прочитано позиций ", failed);
+        chat_say(msg); return;
+    }
     bestObj = g_pk_list[best];
     if (!g_pk_mTrig || g_pk_trigCls != A.object_get_class(bestObj)) {
         g_pk_trigCls = A.object_get_class(bestObj);
