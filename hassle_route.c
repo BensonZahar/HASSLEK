@@ -44,7 +44,9 @@ extern int clock_gettime(int, void*);
 
 #define RT_MAX 30000                 /* точек записи (на ~8 минут непрерывной ходьбы) */
 #define RT_MAXJ 8
-#define RT_FBUF (3 << 19)             /* 1,5 МБ: хватает на заполненную запись */
+#define RT_FBUF (3 << 20)             /* 3 МБ: хватает на заполненную запись вместе с дорожкой позиций */
+#define RT_MAXP 3000                 /* точек дорожки позиций (каждые 250 мс, 12 минут) */
+#define RT_PSTEP 250                 /* шаг дорожки позиций, мс */
 #define RT_MAXMS 600000              /* запись/повтор не длиннее 10 минут */
 
 /* ───────────── дополнительные функции IL2CPP ───────────── */
@@ -93,6 +95,18 @@ static float g_rt_wh[4][2];                                        /* после
 static float g_rt_lx, g_rt_ly;
 static unsigned g_rt_lp;
 static char g_rt_fbuf[RT_FBUF];
+/* дорожка позиций: где вы реально были в записи (читается так же, как «ваша позиция» у /near). Нужна, чтобы повтор мог сам сказать, где и насколько ушёл от записи */
+typedef struct { unsigned t; float x, y, z; } RtP;
+static RtP g_rt_pp[RT_MAXP];
+static volatile int g_rt_pn;
+static int g_rt_ppi;                                               /* индекс для интерполяции при повторе (время растёт — идём вперёд) */
+static long long g_rt_lastP;                                       /* когда писали последнюю точку дорожки (запись) */
+static long long g_rt_lastDev, g_rt_lastDevLog;                    /* когда считали/писали в журнал отклонение (повтор) */
+static float g_rt_maxDev; static long long g_rt_maxDevT;           /* наибольшее отклонение от записи за повтор, и когда */
+static float g_rt_startDev[3];                                     /* на сколько вы стояли не там, где начинали запись (повтор) */
+static void* g_rt_mGT; static void* g_rt_mEA;                      /* Component.get_transform, Transform.get_eulerAngles (реальная камера) */
+static int rt_my_pos(float* me);
+static void b_pos(Buf* b, const float* p);
 /* камера */
 static void* g_rt_aim; static void* g_rt_aimk;                    /* CinemachinePOV и его заголовок (проверка перед записью) */
 static int g_rt_offCH = -1, g_rt_offCV = -1;                      /* абсолютные смещения m_HorizontalAxis.Value / m_VerticalAxis.Value в объекте POV */
@@ -299,6 +313,84 @@ static int rt_cam_write(float c, float v) {
     return 1;
 }
 
+/* Реальный поворот камеры по её Transform (независимо от CinemachinePOV): по ним проверяем, что значение из m_Aim — настоящее.
+   У камеры Cinemachine вращение = Euler(наклон, поворот, 0), поэтому eulerAngles.y должен совпадать с m_HorizontalAxis.Value, а .x — с m_VerticalAxis.Value (по модулю 360). */
+static int rt_cam_true(float* yaw, float* pitch) {
+    void *fn, *cam = NULL, *co, *tr, *exc = NULL, *r; const float* f;
+    if (!g_cGame) return 0;
+    fn = A.class_get_field_from_name(g_cGame, "MainCamera");
+    if (!fn) return 0;
+    A.field_static_get_value(fn, &cam);
+    if (!cam || !nc_obj_ok(cam)) return 0;
+    co = ref_field_s(cam, "m_Camera");
+    if (!co || !nc_obj_ok(co)) return 0;
+    if (!g_rt_mGT) g_rt_mGT = find_method(A.object_get_class(co), "get_transform", 0);
+    if (!g_rt_mGT) return 0;
+    tr = A.runtime_invoke(g_rt_mGT, co, NULL, &exc);
+    if (exc || !tr || !nc_obj_ok(tr)) return 0;
+    if (!g_rt_mEA) g_rt_mEA = find_method(A.object_get_class(tr), "get_eulerAngles", 0);
+    if (!g_rt_mEA) return 0;
+    r = A.runtime_invoke(g_rt_mEA, tr, NULL, &exc);
+    if (exc || !r || !nc_readable((char*)r + HDR, 12)) return 0;
+    f = (const float*)((char*)r + HDR);
+    *pitch = f[0]; *yaw = f[1];
+    return 1;
+}
+static float rt_adiff(float a, float b) {                          /* разница углов, градусы, 0..180 */
+    float d = a - b;
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d < 0 ? -d : d;
+}
+/* 1 — значение из m_Aim совпадает с реальной камерой; 0 — не совпадает (m_Aim НЕ настоящий поворот); -1 — проверить не удалось */
+static int rt_cam_check(void) {
+    float c = 0, v = 0, ty = 0, tx = 0; char t[200]; Buf b;
+    if (!rt_cam_read(&c, &v)) return -1;
+    if (!rt_cam_true(&ty, &tx)) { dlog("маршрут: камера: реальный поворот (Transform) прочитать не удалось, проверка пропущена"); return -1; }
+    b_init(&b, t, sizeof t);
+    b_s(&b, "маршрут: камера: POV "); b_fix(&b, c, 1); b_ch(&b, '/'); b_fix(&b, v, 1);
+    b_s(&b, ", реальная "); b_fix(&b, ty, 1); b_ch(&b, '/'); b_fix(&b, tx, 1);
+    dlog(t);
+    return (rt_adiff(c, ty) <= 5.0f && rt_adiff(v, tx) <= 5.0f) ? 1 : 0;
+}
+
+/* строка в near.log о состоянии: время, камера (POV и реальная), позиция */
+static void rt_log_state(const char* tag, long long ms) {
+    char t[260]; Buf b; float c = 0, v = 0, ty = 0, tx = 0, me[3];
+    int hc = g_rt_aim ? rt_cam_read(&c, &v) : 0, ht = rt_cam_true(&ty, &tx);
+    b_init(&b, t, sizeof t);
+    b_s(&b, "маршрут: "); b_s(&b, tag); b_s(&b, " t="); b_fix(&b, (double)ms / 1000.0, 1); b_s(&b, " с");
+    if (hc) { b_s(&b, ", POV "); b_fix(&b, c, 1); b_ch(&b, '/'); b_fix(&b, v, 1); }
+    if (ht) { b_s(&b, ", камера "); b_fix(&b, ty, 1); b_ch(&b, '/'); b_fix(&b, tx, 1); }
+    if (rt_my_pos(me)) { b_s(&b, ", поз "); b_pos(&b, me); }
+    dlog(t);
+}
+/* дорожка позиций: запись */
+static void rt_pos_push(long long ms) {
+    float me[3]; int n = g_rt_pn;
+    if (n >= RT_MAXP || !rt_my_pos(me)) return;
+    g_rt_pp[n].t = (unsigned)ms; g_rt_pp[n].x = me[0]; g_rt_pp[n].y = me[1]; g_rt_pp[n].z = me[2];
+    __atomic_store_n(&g_rt_pn, n + 1, __ATOMIC_RELEASE);
+    g_rt_lastP = ms;
+}
+/* позиция по записи в момент ms (линейная интерполяция между точками дорожки) */
+static int rt_pos_at(long long ms, float* out) {
+    int n = g_rt_pn, i = g_rt_ppi, k;
+    if (n < 2) return 0;
+    if (i < 0 || i >= n) i = 0;
+    while (i + 1 < n && (long long)g_rt_pp[i + 1].t <= ms) i++;
+    g_rt_ppi = i;
+    if (i + 1 >= n || ms <= (long long)g_rt_pp[i].t) { out[0] = g_rt_pp[i].x; out[1] = g_rt_pp[i].y; out[2] = g_rt_pp[i].z; return 1; }
+    {
+        float f = (float)(ms - (long long)g_rt_pp[i].t) / (float)((long long)g_rt_pp[i + 1].t - (long long)g_rt_pp[i].t);
+        out[0] = g_rt_pp[i].x + (g_rt_pp[i + 1].x - g_rt_pp[i].x) * f;
+        out[1] = g_rt_pp[i].y + (g_rt_pp[i + 1].y - g_rt_pp[i].y) * f;
+        out[2] = g_rt_pp[i].z + (g_rt_pp[i + 1].z - g_rt_pp[i].z) * f;
+    }
+    (void)k;
+    return 1;
+}
+
 /* ───────────── тик: всё происходит в главном потоке ───────────── */
 static void native_route_cmd(void* self, void* args, void* mi);
 static void rt_report(int code);
@@ -342,7 +434,10 @@ static void rt_rec_step(void) {
             g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v; g_rt_lb = b;
             g_rt_n = 0;
             rt_push(0, p, x, y, c, v, b);
+            g_rt_pn = 0; g_rt_lastP = -(long long)RT_PSTEP; g_rt_lastDevLog = -1000;
+            rt_pos_push(0);
             dlog("маршрут: запись началась");
+            rt_log_state("запись", 0);
         }
         return;
     }
@@ -351,6 +446,8 @@ static void rt_rec_step(void) {
         rt_push((unsigned)now, p, x, y, c, v, b);
         g_rt_lp = p; g_rt_lx = x; g_rt_ly = y; g_rt_lc = c; g_rt_lv = v; g_rt_lb = b;
     }
+    if (now - g_rt_lastP >= RT_PSTEP) rt_pos_push(now);
+    if (now - g_rt_lastDevLog >= 1000) { g_rt_lastDevLog = now; rt_log_state("запись", now); }
     if (g_rt_n >= RT_MAX - 2) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(3); return; }
     if (now > RT_MAXMS) { __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE); rt_event(5); return; }
 }
@@ -383,6 +480,23 @@ static void rt_play_step(void) {
             return;
         }
         g_rt_bad = 0;
+    }
+    if (g_rt_pn >= 2 && now - g_rt_lastDev >= 100) {              /* отклонение от записи: где вы сейчас против того, где были в записи в этот же момент */
+        float me[3], rp[3];
+        g_rt_lastDev = now;
+        if (rt_my_pos(me) && rt_pos_at(now, rp)) {
+            double dx = me[0] - rp[0], dy = me[1] - rp[1], dz = me[2] - rp[2];
+            float dev = (float)__builtin_sqrt(dx * dx + dy * dy + dz * dz);
+            if (dev > g_rt_maxDev) { g_rt_maxDev = dev; g_rt_maxDevT = now; }
+            if (now - g_rt_lastDevLog >= 1000) {
+                char t[200]; Buf b; b_init(&b, t, sizeof t);
+                g_rt_lastDevLog = now;
+                b_s(&b, "маршрут: повтор t="); b_fix(&b, (double)now / 1000.0, 1); b_s(&b, " с, отклонение от записи "); b_fix(&b, dev, 2);
+                b_s(&b, " м (Δ "); b_fix(&b, dx, 2); b_s(&b, ", "); b_fix(&b, dy, 2); b_s(&b, ", "); b_fix(&b, dz, 2); b_ch(&b, ')');
+                dlog(t);
+                rt_log_state("повтор", now);
+            }
+        }
     }
     while (g_rt_pi + 1 < n && (long long)g_rt_s[g_rt_pi + 1].t <= now) g_rt_pi++;
     s = &g_rt_s[g_rt_pi];
@@ -448,6 +562,13 @@ static int rt_save(void) {
     if (g_rt_hasE) { b_s(&b, "E "); b_fix(&b, g_rt_E[0], 3); b_ch(&b, ' '); b_fix(&b, g_rt_E[1], 3); b_ch(&b, ' '); b_fix(&b, g_rt_E[2], 3); b_ch(&b, '\n'); }
     if (g_rt_camRec) b_s(&b, "K 1\n");
     if (g_rt_btnRec) b_s(&b, "B 1\n");
+    for (i = 0; i < g_rt_pn; i++) {                                 /* P <мс> x y z — дорожка позиций (для отчёта об отклонении при повторе) */
+        b_s(&b, "P "); b_int(&b, (long)g_rt_pp[i].t); b_ch(&b, ' '); b_fix(&b, g_rt_pp[i].x, 3); b_ch(&b, ' '); b_fix(&b, g_rt_pp[i].y, 3); b_ch(&b, ' '); b_fix(&b, g_rt_pp[i].z, 3); b_ch(&b, '\n');
+        if (b.n > sizeof buf - 100) {
+            if (!flog_write(path, b.p, b.n, first)) return 0;
+            first = 0; b_init(&b, buf, sizeof buf);
+        }
+    }
     for (i = 0; i < n; i++) {
         b_int(&b, (long)g_rt_s[i].t); b_ch(&b, ' '); b_int(&b, (long)g_rt_s[i].p); b_ch(&b, ' ');
         b_fix(&b, g_rt_s[i].x, 3); b_ch(&b, ' '); b_fix(&b, g_rt_s[i].y, 3);
@@ -487,7 +608,7 @@ static int rt_load(void) {
     for (;;) { long r = read(fd, g_rt_fbuf + tot, RT_FBUF - 1 - tot); if (r <= 0) break; tot += r; if (tot >= RT_FBUF - 1) break; }
     close(fd);
     g_rt_fbuf[tot] = 0;
-    g_rt_hasS = g_rt_hasE = 0; g_rt_hn[0] = g_rt_vn[0] = 0; g_rt_idx = -1; g_rt_camRec = 0; g_rt_btnRec = 0;
+    g_rt_hasS = g_rt_hasE = 0; g_rt_hn[0] = g_rt_vn[0] = 0; g_rt_idx = -1; g_rt_camRec = 0; g_rt_btnRec = 0; g_rt_pn = 0;
     for (p = g_rt_fbuf; *p; ) {
         const char* q = p;
         if (*q == 'H') {
@@ -501,6 +622,12 @@ static int rt_load(void) {
             if ((q = rt_num(q, &v[0])) && (q = rt_num(q, &v[1])) && (q = rt_num(q, &v[2]))) {
                 dst[0] = (float)v[0]; dst[1] = (float)v[1]; dst[2] = (float)v[2];
                 if (isS) g_rt_hasS = 1; else g_rt_hasE = 1;
+            }
+        } else if (*q == 'P') {
+            q++;
+            if ((q = rt_num(q, &v[0])) && (q = rt_num(q, &v[1])) && (q = rt_num(q, &v[2])) && (q = rt_num(q, &v[3])) && g_rt_pn < RT_MAXP) {
+                g_rt_pp[g_rt_pn].t = (unsigned)v[0]; g_rt_pp[g_rt_pn].x = (float)v[1]; g_rt_pp[g_rt_pn].y = (float)v[2]; g_rt_pp[g_rt_pn].z = (float)v[3];
+                g_rt_pn++;
             }
         } else if (*q == 'K') {
             g_rt_camRec = 1;
@@ -563,11 +690,15 @@ static void b_pos(Buf* b, const float* p) { b_fix(b, p[0], 1); b_s(b, ", "); b_f
 static double rt_dist2(const float* a, const float* c) { double dx = a[0] - c[0], dy = a[1] - c[1]; return __builtin_sqrt(dx * dx + dy * dy); }   /* по горизонтали, как d2 в /near */
 
 static void rt_report(int code) {                                  /* главный поток */
-    Buf b; char msg[360]; float me[3];
+    Buf b; char msg[520]; float me[3];
     b_init(&b, msg, sizeof msg);
     if (code == 1) {
         b_s(&b, "Маршрут пройден");
-        if (g_rt_hasE && rt_my_pos(me)) { b_s(&b, ". До точки конца записи: "); b_fix(&b, rt_dist2(me, g_rt_E), 1); b_s(&b, " м"); }
+        if (g_rt_hasE && rt_my_pos(me)) {
+            double dx = me[0] - g_rt_E[0], dy = me[1] - g_rt_E[1], dz = me[2] - g_rt_E[2];
+            b_s(&b, ". До точки конца записи: "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 2); b_s(&b, " м (Δ "); b_fix(&b, dx, 2); b_s(&b, ", "); b_fix(&b, dy, 2); b_s(&b, ", "); b_fix(&b, dz, 2); b_ch(&b, ')');
+        }
+        if (g_rt_pn >= 2) { b_s(&b, ". Макс. отклонение от записи "); b_fix(&b, g_rt_maxDev, 2); b_s(&b, " м на "); b_fix(&b, (double)g_rt_maxDevT / 1000.0, 1); b_s(&b, " с"); }
     } else if (code == 2) b_s(&b, "Маршрут: повтор прерван — вы взялись за стик");
     else if (code == 3) { b_s(&b, "Маршрут: запись заполнена. "); rt_stop_rec(&b); }
     else if (code == 4) b_s(&b, "Маршрут: стик пропал (HUD пересоздан?), остановлено. Повторите /route probe");
@@ -585,13 +716,14 @@ static void rt_stop_rec(Buf* b) {                                  /* главн
     n = g_rt_n;
     g_rt_idx = 0; g_rt_hn[0] = '-'; g_rt_hn[1] = 0; g_rt_vn[0] = '-'; g_rt_vn[1] = 0;
     g_rt_hasE = rt_my_pos(me); if (g_rt_hasE) { g_rt_E[0] = me[0]; g_rt_E[1] = me[1]; g_rt_E[2] = me[2]; }
+    rt_pos_push((long long)g_rt_s[n - 1].t);
     b_s(b, "Записано: "); b_int(b, n); b_s(b, " точек, "); b_fix(b, (double)g_rt_s[n - 1].t / 1000.0, 1); b_s(b, " с");
     if (g_rt_hasS && g_rt_hasE) { b_s(b, ", от старта до финиша по прямой "); b_fix(b, rt_dist2(g_rt_S, g_rt_E), 1); b_s(b, " м"); }
     b_s(b, rt_save() ? ". Сохранено в HLOG/route.txt. Повтор: /route play" : ". Файл сохранить не удалось (только в памяти). Повтор: /route play");
 }
 
 static void native_route_cmd(void* self, void* args, void* mi) {
-    int w; Buf b; char msg[420]; float me[3];
+    int w, camBad = 0; Buf b; char msg[900]; float me[3];
     (void)self; (void)mi;
     if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { rt_tick(); return; }   /* вызов из Post (тик), не из чата */
     nc_capture_ctx();                                                /* главный поток: берём контекст для тиков */
@@ -606,7 +738,12 @@ static void native_route_cmd(void* self, void* args, void* mi) {
             b_s(&b, "Стик найден: "); b_s(&b, g_rt_key[0] ? g_rt_key : "-");
             b_s(&b, rd ? ", значение (" : ", значение НЕ читается ("); b_fix(&b, x, 2); b_s(&b, "; "); b_fix(&b, y, 2); b_ch(&b, ')');
         } else b_s(&b, "Стик НЕ найден (причина в near.log)");
-        if (rt_cam_find()) { float c = 0, v = 0; rt_cam_read(&c, &v); b_s(&b, " | камера: поворот "); b_fix(&b, c, 1); b_s(&b, ", наклон "); b_fix(&b, v, 1); }
+        if (rt_cam_find()) {
+            float c = 0, v = 0, ty = 0, tx = 0; int ck;
+            rt_cam_read(&c, &v); ck = rt_cam_check();
+            b_s(&b, " | камера: поворот "); b_fix(&b, c, 1); b_s(&b, ", наклон "); b_fix(&b, v, 1);
+            if (rt_cam_true(&ty, &tx)) { b_s(&b, " (реальная "); b_fix(&b, ty, 1); b_s(&b, "/"); b_fix(&b, tx, 1); b_s(&b, ck == 1 ? ", совпадает)" : ", НЕ СОВПАДАЕТ)"); }
+        }
         else b_s(&b, " | камера: НЕ найдена (см. near.log)");
         b_s(&b, g_nc_ctx ? " | тики: да" : " | тики: НЕТ");
         dlog2("маршрут probe: ", msg);
@@ -634,13 +771,15 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         if (!g_nc_ctx) { b_s(&b, "Маршрут: нет главного потока для тиков (см. near.log)"); chat_say(msg); return; }
         if (rt_find() < 1) { b_s(&b, "Маршрут: стик не найден (HUD с экранным стиком не создан? см. near.log, /route probe)"); chat_say(msg); return; }
         g_rt_camRec = rt_cam_find(); g_rt_lc = g_rt_lv = 0;
+        { int ck = g_rt_camRec ? rt_cam_check() : 1; if (ck == 0) { g_rt_camRec = 0; camBad = 1; } }
+        g_rt_pn = 0; g_rt_ppi = 0;
         { int q, d, any = 0; for (q = 0; q < RT_NB; q++) if (rt_btn_read(q, &d)) any = 1; g_rt_btnRec = any; g_rt_lb = 0; g_rt_bdown = 0; }
         g_rt_n = 0; g_rt_started = 0; g_rt_hasS = rt_my_pos(me); g_rt_hasE = 0;
         if (g_rt_hasS) { g_rt_S[0] = me[0]; g_rt_S[1] = me[1]; g_rt_S[2] = me[2]; }
         g_rt_tickPending = 0;
         __atomic_store_n(&g_rt_mode, 1, __ATOMIC_RELEASE);
         b_s(&b, "Запись маршрута: возьмитесь за левый стик и идите. Конец: /route stop. ");
-        b_s(&b, g_rt_camRec ? "Камера пишется вместе со стиком. " : "Камера НЕ найдена: пишется только стик (при повторе камеру выставляйте сами). ");
+        b_s(&b, g_rt_camRec ? "Камера пишется вместе со стиком. " : camBad ? "Камера НЕ пишется: поворот в m_Aim не совпадает с реальной камерой (см. near.log), камеру при повторе ставьте сами. " : "Камера НЕ найдена: пишется только стик (при повторе камеру выставляйте сами). ");
         b_s(&b, g_rt_btnRec ? "Кнопки Space/Shift/C пишутся (спринт тоже)" : "Кнопки не читаются: спринт при повторе возьмётся по наклону стика");
         chat_say(msg);
         return;
@@ -661,12 +800,21 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         }
         g_rt_camOn = 0;
         if (g_rt_camRec && !(w & 128)) g_rt_camOn = rt_cam_find();
+        if (g_rt_camOn && rt_cam_check() == 0) { g_rt_camOn = 0; camBad = 1; }       /* m_Aim — не настоящий поворот: писать в него нельзя, камера собьётся */
+        g_rt_startDev[0] = g_rt_startDev[1] = g_rt_startDev[2] = 0;
+        if (g_rt_hasS && rt_my_pos(me)) { g_rt_startDev[0] = me[0] - g_rt_S[0]; g_rt_startDev[1] = me[1] - g_rt_S[1]; g_rt_startDev[2] = me[2] - g_rt_S[2]; }
+        g_rt_maxDev = 0; g_rt_maxDevT = 0; g_rt_ppi = 0; g_rt_lastDev = -1000; g_rt_lastDevLog = -1000;
         for (i = 0; i < 4; i++) { g_rt_wh[i][0] = 0; g_rt_wh[i][1] = 0; }
         g_rt_whi = 0; g_rt_down = 0; g_rt_bdown = 0; g_rt_tickPending = 0;
         g_rt_pi = 0; g_rt_wrote = 0; g_rt_bad = 0; g_rt_t0 = rt_now() + (g_rt_camOn ? 250 : 0);       /* с камерой — короткий предстарт: сначала выставляется она */
         __atomic_store_n(&g_rt_mode, 2, __ATOMIC_RELEASE);
         b_s(&b, "Повтор маршрута: "); b_fix(&b, (double)g_rt_s[g_rt_n - 1].t / 1000.0, 1); b_s(&b, " с. ");
-        b_s(&b, g_rt_camOn ? "Камера выставляется сама. " : (g_rt_camRec ? (w & 128 ? "Камера — ваша (nocam). " : "Камеру выставить не удалось: смотрите туда же, куда при записи. ") : "В записи нет камеры: смотрите туда же, куда при записи. "));
+        b_s(&b, g_rt_camOn ? "Камера выставляется сама. " : (g_rt_camRec ? (w & 128 ? "Камера — ваша (nocam). " : camBad ? "Камера в записи не совпадает с реальной (см. near.log): камеру не трогаю, смотрите туда же, куда при записи. " : "Камеру выставить не удалось: смотрите туда же, куда при записи. ") : "В записи нет камеры: смотрите туда же, куда при записи. "));
+        {
+            double sx = g_rt_startDev[0], sy = g_rt_startDev[1], sz = g_rt_startDev[2], sd = __builtin_sqrt(sx * sx + sy * sy + sz * sz);
+            if (g_rt_hasS && sd > 0.25) { b_s(&b, "Вы в "); b_fix(&b, sd, 2); b_s(&b, " м от точки старта (Δ "); b_fix(&b, sx, 2); b_s(&b, ", "); b_fix(&b, sy, 2); b_s(&b, ", "); b_fix(&b, sz, 2); b_s(&b, ") — повтор сместится на столько же. "); }
+            dlog_i("маршрут: старт повтора, смещение от точки начала записи, см: ", (long)(sd * 100.0));
+        }
         b_s(&b, "Остановить: /route stop (или возьмитесь за стик)");
         chat_say(msg);
         return;
